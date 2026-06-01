@@ -38,22 +38,16 @@ function Write-Err($msg)     { Write-Host "[FAIL] $msg" -ForegroundColor Red }
 # -----------------------------------------------------------------------------
 # Find Python: prefer 'py' (Windows Python launcher), fall back to 'python'
 # -----------------------------------------------------------------------------
-function Get-Python {
+function Invoke-Python {
+    param([string[]]$ScriptArgs)
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        return @("py", "-3")
+        & py -3 @ScriptArgs
     } elseif (Get-Command python -ErrorAction SilentlyContinue) {
-        return @("python")
+        & python @ScriptArgs
     } else {
         Write-Err "Python not found. Install from https://www.python.org/downloads/"
         exit 1
     }
-}
-
-$PythonCmd = Get-Python
-
-function Invoke-Python {
-    param([string[]]$Args)
-    & $PythonCmd[0] $PythonCmd[1..($PythonCmd.Length - 1)] @Args
 }
 
 # -----------------------------------------------------------------------------

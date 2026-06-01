@@ -30,9 +30,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+import requests
 from aiokafka import AIOKafkaConsumer
 from opensearchpy import AsyncOpenSearch, helpers
-from sentence_transformers import SentenceTransformer
 
 
 # =============================================================================
@@ -46,8 +46,9 @@ OPENSEARCH_HOST   = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT   = int(os.getenv("OPENSEARCH_PORT", "9200"))
 INDEX_NAME        = os.getenv("INDEX_NAME", "logs-vectors-current")
 
-EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
-EMBEDDING_DIM     = 1024
+GOOGLE_API_KEY    = os.getenv("GOOGLE_API_KEY")
+EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+EMBEDDING_DIM     = 768
 
 BATCH_SIZE        = int(os.getenv("BATCH_SIZE", "500"))
 FLUSH_INTERVAL_S  = float(os.getenv("FLUSH_INTERVAL_S", "30"))
@@ -227,7 +228,7 @@ INDEX_BODY = {
             "raw_logs":     {"type": "object", "enabled": False},  # stored but not indexed
             "embedding": {
                 "type": "knn_vector",
-                "dimension": EMBEDDING_DIM,
+                "dimension": EMBEDDING_DIM,  # 768 for text-embedding-004
                 "method": {
                     "name": "hnsw",
                     "engine": "lucene",
@@ -254,22 +255,32 @@ async def ensure_index(client: AsyncOpenSearch, index_name: str):
 # EMBEDDING SERVICE
 # =============================================================================
 class EmbeddingService:
-    """Wraps the bge-large-en-v1.5 model."""
+    """Wraps Google text-embedding-004 (768-dim) via REST."""
 
-    def __init__(self, model_name: str = EMBEDDING_MODEL):
-        log.info(f"Loading embedding model: {model_name} (this may take a minute on first run)")
-        self.model = SentenceTransformer(model_name)
-        log.info("✅ Embedding model loaded.")
+    _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    def __init__(self):
+        log.info(f"Configuring Google embedding model: {EMBEDDING_MODEL}")
+        log.info("Embedding model ready.")
+
+    def _embed_one(self, text: str) -> List[float]:
+        url = f"{self._BASE_URL}/{EMBEDDING_MODEL}:embedContent"
+        resp = requests.post(
+            url,
+            headers={"x-goog-api-key": GOOGLE_API_KEY},
+            json={
+                "model": f"models/{EMBEDDING_MODEL}",
+                "content": {"parts": [{"text": text}]},
+                "taskType": "RETRIEVAL_DOCUMENT",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["embedding"]["values"]
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Embed a batch of texts. Returns list of 1024-dim vectors."""
-        vectors = self.model.encode(
-            texts,
-            batch_size=EMBED_BATCH_SIZE,
-            normalize_embeddings=True,   # ensure cosine similarity works correctly
-            show_progress_bar=False,
-        )
-        return vectors.tolist()
+        """Embed a batch of texts. Returns list of 768-dim vectors."""
+        return [self._embed_one(t) for t in texts]
 
 
 # =============================================================================

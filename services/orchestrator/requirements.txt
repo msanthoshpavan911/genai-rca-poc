@@ -4,5 +4,3 @@ pydantic==2.10.3
 httpx==0.28.1
 redis==5.2.0
 langgraph==0.2.61
-langchain-core==0.3.27
-langchain-ollama==0.2.2

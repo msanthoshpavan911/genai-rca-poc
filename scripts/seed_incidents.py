@@ -94,7 +94,7 @@ INDEX_BODY = {
             "keywords":    {"type": "keyword"},
             "embedding": {
                 "type": "knn_vector",
-                "dimension": 1024,
+                "dimension": 768,
                 "method": {
                     "name": "hnsw",
                     "engine": "lucene",

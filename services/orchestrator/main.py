@@ -15,19 +15,19 @@ Run:
     uvicorn main:app --port 8000 --reload
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
-from typing import Annotated, Dict, List, Literal, Optional, TypedDict
+from typing import Dict, List, Literal, Optional, TypedDict
 
 import httpx
 import redis.asyncio as redis
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
 
@@ -36,9 +36,9 @@ from pydantic import BaseModel
 # CONFIG
 # =============================================================================
 MCP_BASE_URL     = os.getenv("MCP_BASE_URL", "http://localhost:8001")
-OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-SYNTHESIS_MODEL  = os.getenv("SYNTHESIS_MODEL", "qwen2.5:7b")
-ROUTER_MODEL     = os.getenv("ROUTER_MODEL", "qwen2.5:3b")
+GOOGLE_API_KEY   = os.getenv("GOOGLE_API_KEY")
+SYNTHESIS_MODEL  = os.getenv("SYNTHESIS_MODEL", "gemini-2.0-flash-lite")
+ROUTER_MODEL     = os.getenv("ROUTER_MODEL", "gemini-2.0-flash-lite")
 REDIS_URL        = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -141,22 +141,42 @@ async def call_mcp(tool_path: str, payload: dict) -> dict:
 
 
 # =============================================================================
-# LLMs
+# LLM — Gemini REST API (works with all key formats including AQ. keys)
 # =============================================================================
-def get_router_llm():
-    return ChatOllama(
-        model=ROUTER_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=0.0,
-    )
+_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
-def get_synthesis_llm():
-    return ChatOllama(
-        model=SYNTHESIS_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=0.2,
-    )
+async def call_gemini(model: str, prompt: str, system: str = None, temperature: float = 0.0) -> str:
+    """Call Gemini generateContent REST endpoint with retry on rate limit."""
+    url = f"{_GEMINI_BASE_URL}/{model}:generateContent"
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": temperature},
+    }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+
+    for attempt in range(4):
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                url,
+                headers={"x-goog-api-key": GOOGLE_API_KEY},
+                json=body,
+            )
+        if resp.status_code == 429:
+            log.warning(f"Gemini 429 detail: {resp.text}")
+            try:
+                retry_delay = resp.json()["error"]["details"][-1].get("retryDelay", "60s")
+                wait = int(retry_delay.rstrip("s")) + 2
+            except Exception:
+                wait = 15 * (2 ** attempt)
+            log.warning(f"Gemini rate limit (429), retrying in {wait}s (attempt {attempt + 1}/4)")
+            await asyncio.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+    resp.raise_for_status()
 
 
 # =============================================================================
@@ -181,9 +201,8 @@ async def classify_intent(state: AgentState) -> AgentState:
         return state
 
     # No order number — ask the LLM
-    llm = get_router_llm()
-    result = await llm.ainvoke([HumanMessage(content=INTENT_CLASSIFIER_PROMPT.format(message=message))])
-    classification = result.content.strip().upper().split()[0].rstrip(".,")
+    result = await call_gemini(ROUTER_MODEL, INTENT_CLASSIFIER_PROMPT.format(message=message), temperature=0.0)
+    classification = result.strip().upper().split()[0].rstrip(".,")
     if classification not in {"ORDER_INQUIRY", "STATUS_ONLY", "GENERAL_QUESTION", "CLARIFICATION"}:
         classification = "CLARIFICATION"
     state["intent"] = classification
@@ -264,12 +283,12 @@ async def synthesize_rca(state: AgentState) -> AgentState:
         similar_incidents=incidents_str,
     )
 
-    llm = get_synthesis_llm()
-    result = await llm.ainvoke([
-        SystemMessage(content="You are an expert SRE."),
-        HumanMessage(content=prompt),
-    ])
-    state["response"] = result.content
+    result = await call_gemini(
+        SYNTHESIS_MODEL, prompt,
+        system="You are an expert SRE.",
+        temperature=0.2,
+    )
+    state["response"] = result
     return state
 
 
@@ -374,7 +393,30 @@ def build_graph():
 # =============================================================================
 # FASTAPI APP
 # =============================================================================
-app = FastAPI(title="GenAI RCA Orchestrator")
+agent = build_graph()
+redis_client: Optional[redis.Redis] = None
+
+
+@asynccontextmanager
+async def lifespan(_):
+    global redis_client
+    if not GOOGLE_API_KEY:
+        raise RuntimeError(
+            "GOOGLE_API_KEY environment variable is not set. "
+            "Run: $env:GOOGLE_API_KEY='your_key' before starting the orchestrator."
+        )
+    log.info("GOOGLE_API_KEY is set.")
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        await redis_client.ping()
+        log.info("Redis connected.")
+    except Exception as e:
+        log.warning(f"Redis unavailable, sessions disabled: {e}")
+        redis_client = None
+    yield
+
+
+app = FastAPI(title="GenAI RCA Orchestrator", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -382,21 +424,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-agent = build_graph()
-redis_client: Optional[redis.Redis] = None
-
-
-@app.on_event("startup")
-async def _startup():
-    global redis_client
-    try:
-        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-        await redis_client.ping()
-        log.info("✅ Redis connected.")
-    except Exception as e:
-        log.warning(f"Redis unavailable, sessions disabled: {e}")
-        redis_client = None
 
 
 class ChatRequest(BaseModel):
