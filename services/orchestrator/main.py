@@ -48,6 +48,17 @@ log = logging.getLogger("orchestrator")
 # =============================================================================
 # PROMPTS
 # =============================================================================
+KEYWORD_EXPANSION_PROMPT = """You are a technical search assistant helping find similar past incidents in a microservice order-management system.
+
+Convert the business description below into technical search keywords. Think about: Java exception names, Spring Boot concepts, infrastructure components (HikariCP, Redis, Kafka, PSP gateway), HTTP status codes, and performance terms.
+
+Business description: {description}
+
+Respond with ONLY a single line of space-separated lowercase keywords. No explanation, no punctuation, no bullet points.
+
+Keywords:"""
+
+
 INTENT_CLASSIFIER_PROMPT = """You classify user questions into one of these intents:
 - ORDER_INQUIRY:    asking about a specific order's status, failure, history (mentions order number like ORD-00042)
 - STATUS_ONLY:      asking only "what's the status" with no need for log analysis
@@ -60,30 +71,38 @@ User question: {message}
 Classification:"""
 
 
-RCA_SYNTHESIS_PROMPT = """You are a senior Site Reliability Engineer analyzing application logs to produce a Root Cause Analysis (RCA).
+RCA_SYNTHESIS_PROMPT = """You are a senior Site Reliability Engineer reviewing order activity.
 
-ORDER STATUS:
+ORDER STATUS (from database):
 {order_status}
 
-LOG EVIDENCE (chronological):
+LOG EVIDENCE:
 {log_evidence}
 
 SIMILAR PAST INCIDENTS:
 {similar_incidents}
 
-Produce an RCA in plain English using this exact structure:
+Look at the log evidence. Decide:
+- If ERROR-level logs are present → write a Root Cause Analysis using FORMAT A below.
+- If only INFO/WARN logs are present (no ERROR) → write an Order Summary using FORMAT B below.
+
+Output exactly ONE format. Do not output both. Do not repeat sections. Do not include these instructions in your answer.
+
+==============================
+FORMAT A — Root Cause Analysis
+==============================
 
 **Summary**
-One or two sentences stating what happened.
+One or two sentences describing what failed and which service was the trigger.
 
 **What Happened**
-A factual timeline citing specific timestamps and services.
+Factual timeline from the logs. Cite specific timestamps, service names, and log levels.
 
 **Root Cause**
-The single underlying trigger.
+The single underlying trigger. If multiple failures exist across transactions, identify the common root cause or list each cause once as a sub-bullet. Do not repeat the same cause.
 
 **Contributing Factors**
-Any pre-existing conditions that worsened the failure.
+Pre-existing conditions that worsened the failure. Write "Insufficient evidence" if none found in the logs.
 
 **Recommended Actions**
 1. Immediate: ...
@@ -91,13 +110,27 @@ Any pre-existing conditions that worsened the failure.
 3. Long-term: ...
 
 **Evidence**
-Bullet list of the specific log timestamps and services you relied on.
+Consolidated bullet list of the specific log lines (timestamp + service + message) that support this analysis.
 
-STRICT RULES:
-- Use ONLY facts present in the evidence above.
-- If evidence is insufficient for any section, write "Insufficient evidence for [X]" instead of speculating.
-- Distinguish symptoms (visible errors) from root cause (the trigger that produced them).
-- Cite specific log timestamps and service names — do not paraphrase.
+=========================
+FORMAT B — Order Summary
+=========================
+
+**Summary**
+One or two sentences confirming the order completed successfully.
+
+**What Happened**
+Factual timeline from the logs. Cite specific timestamps and service names.
+
+**Evidence**
+Bullet list of the key log lines that confirm successful completion.
+
+==============================
+RULES:
+- Output only the chosen format — no headers like "STEP 1", "FORMAT A", "IF ERRORS", etc.
+- Use only facts from the log evidence. Never fabricate failures not present in the logs.
+- If the same root cause appears across multiple transactions, state it once.
+- Cite timestamps and service names directly from the evidence.
 """
 
 
@@ -220,15 +253,34 @@ async def analyze_logs(state: AgentState) -> AgentState:
     return state
 
 
+async def _expand_to_technical_keywords(description: str) -> str:
+    """Use the router LLM to convert business language into technical search terms."""
+    llm = get_router_llm()
+    result = await llm.ainvoke([
+        HumanMessage(content=KEYWORD_EXPANSION_PROMPT.format(description=description))
+    ])
+    expanded = result.content.strip().splitlines()[0].strip()
+    log.info(f"Keyword expansion: '{description[:60]}' → '{expanded[:120]}'")
+    return expanded if expanded else description
+
+
 async def find_similar(state: AgentState) -> AgentState:
     log.info("Node: find_similar_incidents")
     description = state["user_message"]
+
     if state.get("log_evidence", {}).get("log_chunks"):
-        # Use the first error chunk's message as a richer signal
+        # Prefer actual error log text — already has specific exception names
         for chunk in state["log_evidence"]["log_chunks"]:
             if chunk.get("has_error"):
                 description = chunk["message"][:500]
                 break
+        else:
+            # Logs found but none with errors — expand business language
+            description = await _expand_to_technical_keywords(description)
+    else:
+        # No log evidence at all — expand business language to technical terms
+        description = await _expand_to_technical_keywords(description)
+
     try:
         result = await call_mcp("/tools/find_similar_incidents", {
             "description": description, "top_k": 3,
@@ -240,19 +292,43 @@ async def find_similar(state: AgentState) -> AgentState:
     return state
 
 
+def _format_evidence(chunks: list) -> str:
+    """Format log chunks into clearly separated transactions with error highlights.
+    Pre-extracting errors per chunk prevents the LLM from conflating multiple
+    distinct failure scenarios into a single incorrect narrative."""
+    if not chunks:
+        return "No log evidence found."
+
+    sections = []
+    for i, c in enumerate(chunks[:10], 1):
+        log_lines = [l.strip() for l in c.get("message", "").split("\n") if l.strip()]
+
+        error_lines = [l for l in log_lines if "] ERROR:" in l or "] WARN:" in l]
+        error_summary = (
+            "  Errors/Warnings detected:\n" +
+            "\n".join(f"    • {l}" for l in error_lines)
+        ) if error_lines else "  No errors — all steps completed successfully."
+
+        sections.append(
+            f"--- TRANSACTION {i} ---\n"
+            f"Time range : {c.get('earliest_ts', '')[:19]} → {c.get('latest_ts', '')[:19]}\n"
+            f"Services   : {', '.join(c.get('services', []))}\n"
+            f"Has errors : {c.get('has_error', False)}\n"
+            f"{error_summary}\n\n"
+            f"Full log:\n{c.get('message', '')}"
+        )
+
+    return "\n\n" + ("=" * 60 + "\n").join(sections)
+
+
 async def synthesize_rca(state: AgentState) -> AgentState:
-    """Build the prompt and let the LLM stream the RCA."""
+    """Build the prompt and let the LLM synthesize the RCA."""
     log.info("Node: synthesize_rca")
 
-    status_str = json.dumps(state.get("order_status", {"found": False}), indent=2)
+    status_str   = json.dumps(state.get("order_status", {"found": False}), indent=2)
+    evidence_str = _format_evidence(state.get("log_evidence", {}).get("log_chunks", []))
 
-    chunks = state.get("log_evidence", {}).get("log_chunks", [])
-    evidence_str = "\n\n".join([
-        f"[Chunk {i+1}] services={c['services']} levels={c['log_levels']}\n{c['message']}"
-        for i, c in enumerate(chunks[:10])  # cap to 10 chunks for context budget
-    ]) or "No log evidence found."
-
-    incidents = state.get("similar_incidents", [])
+    incidents     = state.get("similar_incidents", [])
     incidents_str = "\n\n".join([
         f"[{i['incident_id']}] {i['summary']}\nRoot Cause: {i['root_cause']}\nResolution: {i['resolution']}"
         for i in incidents
@@ -301,6 +377,60 @@ async def status_only_response(state: AgentState) -> AgentState:
     return state
 
 
+async def happy_path_summary(state: AgentState) -> AgentState:
+    """Format executed steps for orders whose logs contain no errors.
+    Purely programmatic — no LLM involved, zero hallucination risk."""
+    log.info("Node: happy_path_summary")
+
+    order_no = state.get("order_no", "unknown")
+    status   = state.get("order_status") or {}
+    chunks   = state.get("log_evidence", {}).get("log_chunks", [])
+
+    lines = [f"**Order {order_no} — Executed Steps**\n"]
+
+    # ── Current status from DB ──────────────────────────────────────────────
+    if status.get("found"):
+        lines.append(
+            f"**Current Status**: {status.get('status')} | "
+            f"Amount: {status.get('amount')} {status.get('currency')} | "
+            f"Location: {status.get('location_name')} ({status.get('region')})"
+        )
+        if status.get("payment_status"):
+            line = f"**Payment**: {status['payment_status']} via {status.get('payment_method', 'N/A')}"
+            if status.get("payment_failure_reason"):
+                line += f" — {status['payment_failure_reason']}"
+            lines.append(line)
+        if status.get("shipment_status"):
+            lines.append(
+                f"**Shipment**: {status['shipment_status']} via "
+                f"{status.get('carrier', 'N/A')} "
+                f"(tracking: {status.get('tracking_id', 'N/A')})"
+            )
+        lines.append("")
+
+    # ── Log timeline ────────────────────────────────────────────────────────
+    if not chunks:
+        lines.append("_No log evidence found for this order in the current index._")
+        state["response"] = "\n".join(lines)
+        return state
+
+    for i, chunk in enumerate(chunks, 1):
+        header = (
+            f"**Transaction {i}**  "
+            f"({chunk.get('earliest_ts', '')[:19]} → {chunk.get('latest_ts', '')[:19]})"
+            f"  services: {', '.join(chunk.get('services', []))}"
+        )
+        lines.append(header)
+
+        log_lines = [l.strip() for l in chunk.get("message", "").split("\n") if l.strip()]
+        for j, entry in enumerate(log_lines, 1):
+            lines.append(f"  {j}. {entry}")
+        lines.append("")
+
+    state["response"] = "\n".join(lines)
+    return state
+
+
 async def clarify_response(state: AgentState) -> AgentState:
     state["response"] = (
         "I'd be happy to help — could you tell me the order number? "
@@ -320,6 +450,14 @@ async def general_response(state: AgentState) -> AgentState:
 # =============================================================================
 # ROUTING
 # =============================================================================
+def route_after_logs(state: AgentState) -> Literal["rca", "happy_path"]:
+    evidence = state.get("log_evidence") or {}
+    chunks   = evidence.get("log_chunks", [])
+    if chunks and not evidence.get("has_errors", False):
+        return "happy_path"
+    return "rca"
+
+
 def route_after_classify(state: AgentState) -> Literal["evidence", "status_only", "general", "clarify"]:
     intent = state.get("intent")
     if intent == "ORDER_INQUIRY":
@@ -340,6 +478,7 @@ def build_graph():
     graph.add_node("classify", classify_intent)
     graph.add_node("fetch_status_inquiry", fetch_order_status)
     graph.add_node("analyze_logs", analyze_logs)
+    graph.add_node("happy_path_summary", happy_path_summary)
     graph.add_node("find_similar", find_similar)
     graph.add_node("synthesize", synthesize_rca)
     graph.add_node("fetch_status_only", fetch_order_status)
@@ -356,10 +495,16 @@ def build_graph():
         "clarify":      "clarify",
     })
 
-    # ORDER_INQUIRY pipeline: status → logs → similar → synthesize
-    # (Run sequentially for simplicity; LangGraph supports true parallel too.)
     graph.add_edge("fetch_status_inquiry", "analyze_logs")
-    graph.add_edge("analyze_logs", "find_similar")
+
+    # After log retrieval: happy-path logs → clean step summary (no LLM)
+    #                      error logs / no logs → RCA pipeline
+    graph.add_conditional_edges("analyze_logs", route_after_logs, {
+        "happy_path": "happy_path_summary",
+        "rca":        "find_similar",
+    })
+    graph.add_edge("happy_path_summary", END)
+
     graph.add_edge("find_similar", "synthesize")
     graph.add_edge("synthesize", END)
 

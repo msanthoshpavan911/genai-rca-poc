@@ -1,11 +1,10 @@
 """
 =============================================================================
-Log Ingestor — Kafka → Embeddings → OpenSearch k-NN
+Log Ingestor — Kafka → OpenSearch (DQL full-text)
 =============================================================================
 
 Consumes the app-logs topic, groups logs by trace_id within rolling windows,
-generates embeddings using bge-large-en-v1.5, and writes to OpenSearch
-logs-vectors-* index.
+and bulk-indexes structured log chunks into OpenSearch for DQL-based retrieval.
 
 Batching:
   - Flushes when 500 logs OR 30 seconds elapse, whichever first
@@ -32,7 +31,6 @@ from typing import Dict, List, Optional
 
 from aiokafka import AIOKafkaConsumer
 from opensearchpy import AsyncOpenSearch, helpers
-from sentence_transformers import SentenceTransformer
 
 
 # =============================================================================
@@ -46,13 +44,9 @@ OPENSEARCH_HOST   = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT   = int(os.getenv("OPENSEARCH_PORT", "9200"))
 INDEX_NAME        = os.getenv("INDEX_NAME", "logs-vectors-current")
 
-EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
-EMBEDDING_DIM     = 1024
-
 BATCH_SIZE        = int(os.getenv("BATCH_SIZE", "500"))
 FLUSH_INTERVAL_S  = float(os.getenv("FLUSH_INTERVAL_S", "30"))
 CHUNK_WINDOW_S    = float(os.getenv("CHUNK_WINDOW_S", "60"))
-EMBED_BATCH_SIZE  = int(os.getenv("EMBED_BATCH_SIZE", "32"))
 
 DROP_LEVELS       = {"DEBUG", "TRACE"}
 
@@ -96,7 +90,7 @@ class LogChunk:
     latest_ts: datetime
     has_error: bool
     raw_logs: List[Dict]
-    composed_text: str    # what gets embedded
+    composed_text: str    # stored as the searchable message field
 
 
 # =============================================================================
@@ -177,12 +171,12 @@ class TraceChunker:
         """Build a LogChunk from a list of correlated LogEvents."""
         events = sorted(events, key=lambda e: e.timestamp)
 
-        # Compose embedding-friendly text
+        # Compose the searchable message text
         lines = []
         for e in events:
-            line = f"[{e.timestamp.strftime('%H:%M:%S')}] [{e.service}] {e.level}: {e.message}"
+            line = f"[{e.timestamp.strftime('%Y-%m-%d %H:%M:%S')}] [{e.service}] {e.level}: {e.message}"
             if e.exception:
-                # Just include first line of exception for embedding context
+                # Include first line of exception for searchability
                 first_exc_line = e.exception.split('\n')[0]
                 line += f" | exception: {first_exc_line}"
             lines.append(line)
@@ -207,10 +201,9 @@ class TraceChunker:
 # =============================================================================
 INDEX_BODY = {
     "settings": {
-        "index.knn": True,
         "index.refresh_interval": "30s",
-        "number_of_shards": 1,        # local POC — production uses 3
-        "number_of_replicas": 0,      # local POC has only one node
+        "number_of_shards": 1,
+        "number_of_replicas": 0,
     },
     "mappings": {
         "properties": {
@@ -224,17 +217,7 @@ INDEX_BODY = {
             "earliest_ts":  {"type": "date"},
             "latest_ts":    {"type": "date"},
             "message":      {"type": "text"},
-            "raw_logs":     {"type": "object", "enabled": False},  # stored but not indexed
-            "embedding": {
-                "type": "knn_vector",
-                "dimension": EMBEDDING_DIM,
-                "method": {
-                    "name": "hnsw",
-                    "engine": "lucene",
-                    "space_type": "cosinesimil",
-                    "parameters": {"ef_construction": 256, "m": 16},
-                },
-            },
+            "raw_logs":     {"type": "object", "enabled": False},
         }
     },
 }
@@ -251,44 +234,21 @@ async def ensure_index(client: AsyncOpenSearch, index_name: str):
 
 
 # =============================================================================
-# EMBEDDING SERVICE
-# =============================================================================
-class EmbeddingService:
-    """Wraps the bge-large-en-v1.5 model."""
-
-    def __init__(self, model_name: str = EMBEDDING_MODEL):
-        log.info(f"Loading embedding model: {model_name} (this may take a minute on first run)")
-        self.model = SentenceTransformer(model_name)
-        log.info("✅ Embedding model loaded.")
-
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Embed a batch of texts. Returns list of 1024-dim vectors."""
-        vectors = self.model.encode(
-            texts,
-            batch_size=EMBED_BATCH_SIZE,
-            normalize_embeddings=True,   # ensure cosine similarity works correctly
-            show_progress_bar=False,
-        )
-        return vectors.tolist()
-
-
-# =============================================================================
 # MAIN INGESTOR LOOP
 # =============================================================================
 class Ingestor:
     def __init__(self):
         self.consumer: Optional[AIOKafkaConsumer] = None
         self.os_client: Optional[AsyncOpenSearch] = None
-        self.embedder: Optional[EmbeddingService] = None
         self.chunker = TraceChunker()
         self.buffer_count = 0
         self.last_flush = time.time()
         self.shutdown = asyncio.Event()
+        self._flush_lock = asyncio.Lock()
+        self._flush_task: Optional[asyncio.Task] = None
 
     async def start(self):
         log.info("🚀 Starting ingestor…")
-        self.embedder = EmbeddingService()
-
         self.os_client = AsyncOpenSearch(
             hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
             use_ssl=False,
@@ -304,11 +264,29 @@ class Ingestor:
             auto_offset_reset="earliest",
         )
         await self.consumer.start()
+        self._flush_task = asyncio.create_task(self._periodic_flush())
         log.info(f"✅ Consumer started on topic={KAFKA_TOPIC} group={KAFKA_GROUP}")
+
+    async def _periodic_flush(self):
+        """Background task: drain ready chunks every FLUSH_INTERVAL_S seconds
+        even when no new Kafka messages are arriving."""
+        while True:
+            try:
+                await asyncio.sleep(FLUSH_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            if self.shutdown.is_set():
+                return
+            await self.flush()
 
     async def stop(self):
         log.info("🛑 Shutting down…")
-        # Final flush to capture remaining buffered traces
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
         await self.flush(force=True)
         if self.consumer:
             await self.consumer.stop()
@@ -346,60 +324,56 @@ class Ingestor:
             await self.stop()
 
     async def flush(self, force: bool = False):
-        """Drain ready chunks, embed them, and index to OpenSearch."""
-        chunks = self.chunker.drain_ready(force_all=force)
-        if not chunks:
+        """Drain ready chunks and index to OpenSearch.
+        Lock prevents the periodic background flush and the message-triggered
+        flush from running concurrently."""
+        async with self._flush_lock:
+            chunks = self.chunker.drain_ready(force_all=force)
+            if not chunks:
+                self.buffer_count = 0
+                self.last_flush = time.time()
+                return
+
+            log.info(f"Flushing {len(chunks)} chunks ({self.buffer_count} raw logs)")
+
+            actions = []
+            for chunk in chunks:
+                chunk_id = self._chunk_id(chunk)
+                actions.append({
+                    "_op_type": "index",
+                    "_index": INDEX_NAME,
+                    "_id": chunk_id,
+                    "_source": {
+                        "chunk_id":     chunk_id,
+                        "order_no":     chunk.order_no,
+                        "trace_id":     chunk.trace_id,
+                        "location_no":  chunk.location_no,
+                        "services":     chunk.services,
+                        "log_levels":   chunk.log_levels,
+                        "has_error":    chunk.has_error,
+                        "earliest_ts":  chunk.earliest_ts.isoformat(),
+                        "latest_ts":    chunk.latest_ts.isoformat(),
+                        "message":      chunk.composed_text,
+                        "raw_logs":     chunk.raw_logs,
+                    },
+                })
+
+            try:
+                success, errors = await helpers.async_bulk(
+                    self.os_client, actions, refresh=False, raise_on_error=False
+                )
+                if errors:
+                    log.error(f"OpenSearch bulk errors: {len(errors)} (first: {errors[:1]})")
+                else:
+                    log.info(f"✅ Indexed {success} chunks to {INDEX_NAME}")
+
+                await self.consumer.commit()
+            except Exception as e:
+                log.error(f"Flush failed, will retry on next tick: {e}")
+                return
+
             self.buffer_count = 0
             self.last_flush = time.time()
-            return
-
-        log.info(f"Flushing {len(chunks)} chunks ({self.buffer_count} raw logs)")
-
-        # Embed in batches
-        texts = [c.composed_text for c in chunks]
-        embeddings = self.embedder.embed_batch(texts)
-
-        # Build OpenSearch bulk actions with deterministic IDs
-        actions = []
-        for chunk, vector in zip(chunks, embeddings):
-            chunk_id = self._chunk_id(chunk)
-            actions.append({
-                "_op_type": "index",
-                "_index": INDEX_NAME,
-                "_id": chunk_id,
-                "_source": {
-                    "chunk_id":     chunk_id,
-                    "order_no":     chunk.order_no,
-                    "trace_id":     chunk.trace_id,
-                    "location_no":  chunk.location_no,
-                    "services":     chunk.services,
-                    "log_levels":   chunk.log_levels,
-                    "has_error":    chunk.has_error,
-                    "earliest_ts":  chunk.earliest_ts.isoformat(),
-                    "latest_ts":    chunk.latest_ts.isoformat(),
-                    "message":      chunk.composed_text,
-                    "raw_logs":     chunk.raw_logs,
-                    "embedding":    vector,
-                },
-            })
-
-        try:
-            success, errors = await helpers.async_bulk(
-                self.os_client, actions, refresh=False, raise_on_error=False
-            )
-            if errors:
-                log.error(f"OpenSearch bulk errors: {len(errors)} (first: {errors[:1]})")
-            else:
-                log.info(f"✅ Indexed {success} chunks to {INDEX_NAME}")
-
-            # Commit Kafka offsets ONLY after successful write
-            await self.consumer.commit()
-        except Exception as e:
-            log.error(f"Flush failed, will retry on next message: {e}")
-            return
-
-        self.buffer_count = 0
-        self.last_flush = time.time()
 
     @staticmethod
     def _chunk_id(chunk: LogChunk) -> str:

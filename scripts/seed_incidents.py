@@ -9,11 +9,8 @@ Usage:
 
 import asyncio
 import os
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "mcp-server"))
 
 from opensearchpy import AsyncOpenSearch, helpers
-from embedding import embed
 
 
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
@@ -81,7 +78,6 @@ INCIDENTS = [
 
 INDEX_BODY = {
     "settings": {
-        "index.knn": True,
         "number_of_shards": 1,
         "number_of_replicas": 0,
     },
@@ -91,17 +87,7 @@ INDEX_BODY = {
             "summary":     {"type": "text"},
             "root_cause":  {"type": "text"},
             "resolution":  {"type": "text"},
-            "keywords":    {"type": "keyword"},
-            "embedding": {
-                "type": "knn_vector",
-                "dimension": 1024,
-                "method": {
-                    "name": "hnsw",
-                    "engine": "lucene",
-                    "space_type": "cosinesimil",
-                    "parameters": {"ef_construction": 256, "m": 16},
-                },
-            },
+            "keywords":    {"type": "text"},   # text so multi_match can search it
         }
     },
 }
@@ -122,23 +108,16 @@ async def main():
     await client.indices.create(index=INDEX_NAME, body=INDEX_BODY)
     print(f"✅ Created index {INDEX_NAME}")
 
-    # Embed each incident
-    texts = [
-        f"{i['summary']}. Root cause: {i['root_cause']}. Resolution: {i['resolution']}"
-        for i in INCIDENTS
-    ]
-    print(f"Generating embeddings for {len(texts)} incidents...")
-    vectors = embed(texts)
-
-    # Bulk index
-    actions = []
-    for inc, vec in zip(INCIDENTS, vectors):
-        actions.append({
+    # Bulk index (no embeddings — DQL full-text search used at query time)
+    actions = [
+        {
             "_op_type": "index",
             "_index": INDEX_NAME,
             "_id": inc["incident_id"],
-            "_source": {**inc, "embedding": vec},
-        })
+            "_source": inc,
+        }
+        for inc in INCIDENTS
+    ]
 
     success, errors = await helpers.async_bulk(client, actions, refresh=True)
     print(f"✅ Indexed {success} incidents")

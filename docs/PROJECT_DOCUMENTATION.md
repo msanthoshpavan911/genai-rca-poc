@@ -22,6 +22,7 @@ A complete, locally-runnable Proof of Concept that demonstrates how to add a Gen
 12. [What You Should See](#what-you-should-see)
 13. [From POC to Production](#from-poc-to-production)
 14. [For the Client Pitch](#for-the-client-pitch)
+15. [Frequently Asked Questions](#frequently-asked-questions)
 
 ---
 
@@ -48,10 +49,10 @@ This POC is **architecturally identical** to what we'd deploy in production. The
 |---|---|---|
 | Log producers | Real Spring Boot microservices | Python mock generator simulating 10 failure scenarios |
 | Message bus | Existing enterprise Kafka cluster | Single-node Kafka in Docker |
-| Vector store | OpenSearch cluster with k-NN plugin | Single-node OpenSearch in Docker |
+| Log store | OpenSearch cluster | Single-node OpenSearch in Docker |
+| Log retrieval | DQL full-text search (BM25) | Same — `multi_match` + filter queries |
 | Order database | Enterprise Postgres/Oracle | Postgres in Docker, seeded with 200 orders |
-| Embeddings | Self-hosted bge-large-en-v1.5 | Same — bge-large-en-v1.5 on CPU |
-| LLM (synthesis) | Claude Sonnet 4.5 | Ollama qwen2.5:3b on CPU |
+| LLM (synthesis) | Claude Sonnet 4.5 | Ollama qwen2.5:7b on CPU |
 | LLM (routing) | Claude Haiku 4.5 | Ollama qwen2.5:3b on CPU |
 | MCP tools | 3 tools via official MCP protocol | Same 3 tools via FastAPI HTTP |
 | Agent | LangGraph state machine | Same code |
@@ -86,13 +87,13 @@ This POC is **architecturally identical** to what we'd deploy in production. The
 │           │  (existing)  │   │  (aiokafka)      │                           │
 │           └──────┬───────┘   └────────┬─────────┘                           │
 │                  │                    │                                     │
-│                  ▼                    │ embed (bge-large)                   │
+│                  ▼                    │ parse + chunk (60s window)          │
 │           ┌──────────────┐            ▼                                     │
 │           │  OpenSearch  │   ┌──────────────────┐                           │
 │           │   logs-*     │   │   OpenSearch     │  ← NEW                    │
 │           │  (existing)  │   │ logs-vectors-*   │                           │
-│           └──────────────┘   │ (k-NN, HNSW,     │                           │
-│                              │  dim=1024)       │                           │
+│           └──────────────┘   │ (BM25 full-text, │                           │
+│                              │  DQL filter)     │                           │
 │                              └────────┬─────────┘                           │
 └─────────────────────────────────────────┼─────────────────────────────────-─┘
                                           │
@@ -160,12 +161,11 @@ genai-rca-poc/
     │   └── requirements.txt
     │
     ├── ingestor/
-    │   ├── ingestor.py             # Kafka → embeddings → OpenSearch k-NN
+    │   ├── ingestor.py             # Kafka → chunk → OpenSearch (DQL)
     │   └── requirements.txt
     │
     ├── mcp-server/
     │   ├── server.py               # 3 tools exposed as HTTP endpoints
-    │   ├── embedding.py            # Shared bge-large wrapper
     │   └── requirements.txt
     │
     ├── orchestrator/
@@ -216,7 +216,7 @@ Each failure scenario emits **multiple correlated logs across services with the 
 Single broker, KRaft mode (no Zookeeper needed). The topic `app-logs` is the contract between log producers and consumers. Two consumer groups read from it independently:
 
 - `logstash-cg` (existing) — feeds the standard ELK/OpenSearch logs index
-- `genai-ingestor-cg` (new) — feeds the vector index for GenAI RCA
+- `genai-ingestor-cg` (new) — feeds the log index for GenAI RCA
 
 Kafka tracks offsets per consumer group, so the two are completely independent.
 
@@ -226,14 +226,15 @@ The most code-heavy service. For each batch of logs:
 
 1. **Consume** from Kafka via `aiokafka`
 2. **Parse** JSON, extract metadata (order_no, trace_id, service, etc.)
-3. **Mask PII** with regex (emails, card numbers, phones) *before* embedding
+3. **Mask PII** with regex (emails, card numbers, phones) before indexing
 4. **Drop noise** (DEBUG, TRACE logs)
-5. **Chunk by `trace_id`** in 60-second windows — groups all logs from one transaction into one logical chunk for better RAG retrieval
-6. **Embed** each chunk with `bge-large-en-v1.5` (1024-dim vectors)
-7. **Bulk index** to OpenSearch `logs-vectors-current` with deterministic IDs
-8. **Commit Kafka offsets** only after successful indexing (at-least-once semantics)
+5. **Chunk by `trace_id`** in 60-second windows — groups all logs from one transaction into one logical chunk for better retrieval
+6. **Bulk index** to OpenSearch `logs-vectors-current` with deterministic IDs
+7. **Commit Kafka offsets** only after successful indexing (at-least-once semantics)
 
-Batches flush when **500 logs OR 30 seconds elapse**, whichever comes first.
+Flushes trigger two ways — whichever comes first:
+- **Message-triggered**: when 500 logs buffered OR 30 seconds elapsed since last flush
+- **Background timer**: a periodic asyncio task flushes every 30 seconds independently, so chunks drain even when the log stream goes quiet
 
 ### 4. OpenSearch (Docker)
 
@@ -241,11 +242,12 @@ Single-node, security disabled (POC only). Two indices:
 
 **`logs-vectors-current`** — created by the ingestor:
 - 1 shard, 0 replicas (POC; production uses 3 + 1)
-- `knn_vector` field with dimension=1024, HNSW algorithm, cosine similarity, m=16, ef_construction=256
+- Fields: `order_no` (keyword), `message` (text), `has_error` (boolean), `services` (keyword), `log_levels` (keyword), `earliest_ts` / `latest_ts` (date), `raw_logs` (stored, not indexed)
+- Searched via DQL: hard `term` filter on `order_no`, with `should` boost clauses on `message` content and `has_error`
 
 **`incidents-historical`** — seeded once by `scripts/seed_incidents.py`:
-- 8 mock past RCAs with summary, root cause, resolution, embeddings
-- Used by the `find_similar_incidents` MCP tool for RAG
+- 8 mock past RCAs with `summary`, `root_cause`, `resolution`, `keywords` fields — all `text` type for full-text search
+- Used by the `find_similar_incidents` MCP tool via `multi_match` DQL query
 
 ### 5. Postgres (Docker)
 
@@ -266,9 +268,11 @@ Exposes 3 tools as HTTP endpoints (functionally identical to MCP protocol; trivi
 
 **Input**: `order_no`, optional `additional_context`, `top_k`
 
-**What it does**: Filter-based search on `order_no` against OpenSearch `logs-vectors-current`. Returns chunks containing the actual log lines, services involved, log levels, error flags.
+**What it does**: DQL `bool` query against OpenSearch `logs-vectors-current`. The `order_no` `term` filter is a hard constraint (only that order's logs). `should` clauses boost relevance within those results:
+- Error chunks (`has_error: true`) are boosted 1.5×
+- If `additional_context` is provided, chunks whose `message` text matches it are boosted 2×
 
-**Production version**: would combine BM25 + k-NN + filter in a hybrid query. POC uses simple filter for reliability.
+Returns chunks sorted by `earliest_ts` (chronological), so the LLM sees the timeline in order.
 
 #### Tool 2: `get_order_status`
 
@@ -280,21 +284,50 @@ Exposes 3 tools as HTTP endpoints (functionally identical to MCP protocol; trivi
 
 **Input**: free-text issue description, `top_k`
 
-**What it does**: Embeds the description, k-NN searches the `incidents-historical` index, returns the top similar past RCAs.
+**What it does**: DQL `bool/should` query against `incidents-historical`. Uses `multi_match` across `summary^3`, `root_cause^2`, `resolution^1` with `fuzziness: AUTO` and a `match` boost on the `keywords` field. Returns the top matching past RCAs ranked by BM25 score.
 
 ### 7. Orchestrator (`services/orchestrator/main.py`)
 
-The "brain" of the system. Built on **LangGraph** as a state machine, not a free-form ReAct loop. Five nodes:
+The "brain" of the system. Built on **LangGraph** as a state machine with two routing decisions:
 
-1. **`classify_intent`** — uses `qwen2.5:3b` (router model) to determine: ORDER_INQUIRY, STATUS_ONLY, GENERAL_QUESTION, or CLARIFICATION
-2. **`fetch_order_status`** — calls MCP tool 2
-3. **`analyze_logs`** — calls MCP tool 1
-4. **`find_similar`** — calls MCP tool 3
-5. **`synthesize_rca`** — uses `qwen2.5:3b` (synthesis model) with strict grounding prompt
+**Nodes:**
 
-The flow branches based on intent. Order inquiries run all 5 nodes; status-only queries skip directly to a structured response.
+| Node | What it does |
+|---|---|
+| `classify_intent` | Router LLM (`qwen2.5:3b`) classifies into ORDER_INQUIRY / STATUS_ONLY / GENERAL_QUESTION / CLARIFICATION |
+| `fetch_order_status` | Calls MCP Tool 2 — SQL JOIN from Postgres |
+| `analyze_logs` | Calls MCP Tool 1 — DQL filter on OpenSearch |
+| `happy_path_summary` | Programmatic step formatter — no LLM, zero hallucination risk |
+| `find_similar` | Calls MCP Tool 3 — with keyword expansion for business language |
+| `synthesize_rca` | Synthesis LLM (`qwen2.5:7b`) — generates structured RCA |
 
-**Important prompt engineering**: The synthesis prompt requires the LLM to admit "insufficient evidence" rather than hallucinate. This is what produces high-quality, defensible RCAs.
+**Flow:**
+
+```
+classify_intent
+    │
+    ├── ORDER_INQUIRY → fetch_order_status → analyze_logs
+    │                                              │
+    │                          has_errors=False ──►│──► happy_path_summary → END
+    │                          (logs found,         │
+    │                           no errors)          │
+    │                          has_errors=True  ──►│──► find_similar → synthesize_rca → END
+    │                          (or no logs)
+    │
+    ├── STATUS_ONLY  → fetch_order_status → status_response → END
+    ├── GENERAL_QUESTION → general_response → END
+    └── CLARIFICATION    → clarify_response → END
+```
+
+**Key design decisions:**
+
+- **Happy-path routing**: after `analyze_logs`, if all log chunks have no ERROR-level events, the flow short-circuits to `happy_path_summary` — a pure programmatic formatter that lists executed steps. No LLM is called, so there is no hallucination risk.
+
+- **Keyword expansion**: when `find_similar` has no error log text to use (e.g. a business-language query like "customers are complaining orders are slow"), it calls the router LLM first to convert the description into technical search terms (`timeout latency connection pool circuit breaker`) before querying OpenSearch.
+
+- **Evidence pre-structuring**: before the RCA synthesis LLM sees the log chunks, `_format_evidence()` pre-labels each chunk with its transaction number, time range, services, and extracted ERROR/WARN lines. This prevents the LLM from conflating multiple distinct failure scenarios into a single incorrect summary.
+
+- **Grounded prompting**: the synthesis prompt explicitly checks for the presence of ERROR logs in the evidence. If none found, it produces an order summary instead of an RCA — and it is forbidden from stating a failure occurred unless ERROR logs are present.
 
 ### 8. React UI (`services/ui/index.html`)
 
@@ -365,7 +398,7 @@ The chunker groups all of these into one searchable unit, so when the LLM gets t
 | Python | 3.11+ | All services are Python |
 | Ollama | 0.1+ | Local LLM server |
 | 16 GB RAM | — | OpenSearch (1.5 GB) + LLM (2 GB) + everything else |
-| 50 GB disk | — | Docker images + models |
+| 20 GB disk | — | Docker images + Ollama models (no embedding model needed) |
 
 ### For Windows users specifically
 
@@ -428,7 +461,7 @@ python -m pip install -r services\mcp-server\requirements.txt
 python -m pip install -r services\orchestrator\requirements.txt
 ```
 
-**Note**: PyTorch is ~2 GB. The ingestor's install is the slow one — be patient.
+**Note**: Dependencies are lightweight — no embedding model or PyTorch required. Install completes in under a minute.
 
 ### Step 4: Verify everything is healthy
 
@@ -459,7 +492,7 @@ The two warnings at the bottom are expected at this stage — those services are
 python scripts\seed_incidents.py
 ```
 
-This populates the `incidents-historical` index with 8 mock past RCAs. The first run downloads the `bge-large-en-v1.5` model (~1.3 GB) — be patient.
+This deletes and recreates the `incidents-historical` index with 8 mock past RCAs. Completes in a few seconds — no model download required.
 
 ### Step 6: Generate mock logs to Kafka
 
@@ -644,10 +677,18 @@ This means the MCP tool isn't finding logs for the order number you queried. Two
 
 ### Ingestor consumes from Kafka but never flushes
 
-The ingestor flushes on either 500 logs buffered OR 30 seconds elapsed since the last message. If you generated < 500 logs and stopped, the flush won't trigger until more messages arrive. Just generate more logs:
+The ingestor has two flush triggers:
+- **Background timer**: flushes every 30 seconds automatically, even when no new messages arrive
+- **Message-triggered**: flushes when 500 logs are buffered
 
+If you just started the ingestor and it consumed a batch, wait up to 90 seconds (60s chunk window + 30s timer tick) for the background flush to fire. You will see:
+```
+INFO Flushing N chunks (N raw logs)
+INFO ✅ Indexed N chunks to logs-vectors-current
+```
+If it still doesn't flush, generate a small burst to trigger the chunk window expiry:
 ```powershell
-python services\log-generator\generate_logs.py --transactions 50 --rate 10
+python services\log-generator\generate_logs.py --transactions 10 --rate 10
 ```
 
 ### LangChain dependency conflict
@@ -664,26 +705,67 @@ Better long-term fix: use a virtual environment per project.
 
 ## What You Should See
 
-### Successful RCA response
+The response format depends on what the logs contain. The system routes to different outputs automatically.
 
-When everything works, a query like "Why did ORD-00175 fail?" returns a JSON response like:
+### Response 1 — Failed order (RCA)
 
-```json
-{
-    "response": "**Summary**\nOrder ORD-00175 failed to process due to a database connection issue...\n\n**What Happened**\n[11:38:48] [order-service] INFO: Received order request...\n[11:38:48] [order-service] WARN: HikariCP pool utilization at 95%...\n[11:38:58] [order-service] ERROR: Failed to obtain JDBC Connection...\n\n**Root Cause**\nThe HikariCP database connection pool was exhausted (48/50 active connections)...\n\n**Contributing Factors**\n- Long-running queries from a misbehaving background job\n\n**Recommended Actions**\n1. Immediate: Restart the order-service to release stuck connections\n2. Short-term: Increase HikariCP max pool size from 50 to 100\n3. Long-term: Add monitoring on pool utilization with alerts at 80%\n\n**Evidence**\n- [11:38:48] order-service: HikariCP pool utilization at 95%\n- [11:38:58] order-service: Connection is not available, timed out after 10000ms\n- [11:38:58] order-service: Order ORD-00175 FAILED: database unavailable",
-    "intent": "ORDER_INQUIRY",
-    "order_no": "ORD-00175",
-    "evidence_count": 1
-}
+Query: `"Why did ORD-00175 fail?"`
+
+```
+**Summary**
+Order ORD-00175 failed due to HikariCP connection pool exhaustion...
+
+**What Happened**
+[11:38:48] [order-service] WARN: HikariCP pool utilization at 95%
+[11:38:58] [order-service] ERROR: Failed to obtain JDBC Connection
+[11:38:58] [order-service] ERROR: Order ORD-00175 FAILED: database unavailable
+
+**Root Cause**
+HikariCP pool maxed out — long-running queries held connections beyond their lifespan.
+
+**Contributing Factors**
+Misbehaving background cron job holding open connections.
+
+**Recommended Actions**
+1. Immediate: Restart order-service to release stuck connections
+2. Short-term: Increase HikariCP max pool size from 50 to 100
+3. Long-term: Add alerting on pool utilisation > 80%
+
+**Evidence**
+- [11:38:48] order-service: HikariCP pool utilization at 95%
+- [11:38:58] order-service: Connection is not available, timed out after 10000ms
 ```
 
-Key things to notice:
+---
+
+### Response 2 — Successful order (Executed Steps)
+
+Query: `"More details about ORD-00093"`
+
+When logs exist but contain no ERROR-level events, the system skips the RCA pipeline entirely and returns a clean step-by-step summary — no LLM involved:
+
+```
+**Order ORD-00093 — Executed Steps**
+
+**Current Status**: COMPLETED | Amount: 179.00 USD | Location: London (LON)
+**Payment**: COMPLETED via CARD
+**Shipment**: SHIPPED via FedEx (tracking: TRK-00093)
+
+**Transaction 1**  (2026-06-03T09:15:23 → 2026-06-03T09:15:25)  services: order-service, payment-service, ...
+  1. [09:15:23] [order-service] INFO: Received order request for ORD-00093
+  2. [09:15:23] [inventory-service] INFO: Inventory check passed at LOC-LON-01
+  3. [09:15:23] [payment-service] INFO: Initiating payment, amount=179.00 USD
+  4. [09:15:25] [payment-service] INFO: Payment captured, txn_id=TXN815461
+  5. [09:15:25] [order-service] INFO: Order confirmed COMPLETED
+  6. [09:15:25] [shipping-service] INFO: Shipment created via FedEx (SHP-00093)
+```
+
+Key things to notice across both responses:
 
 - **`evidence_count > 0`** — actual logs were retrieved from OpenSearch
 - **`intent`** — correctly classified by the routing LLM
 - **`order_no`** — correctly extracted from the natural-language query
-- **`response`** — structured RCA with specific timestamps, services, exceptions
-- **Contributing factors** often reference patterns from the `find_similar_incidents` RAG, e.g., the LLM connecting current symptoms to a past incident's root cause
+- **No hallucination on happy paths** — the executed steps formatter reads directly from structured log data
 
 ---
 
@@ -729,13 +811,21 @@ Let them pick the order number. Watch their face when the RCA streams back in 10
 The response cites specific log timestamps and service names. Open OpenSearch Dashboards (http://localhost:5601) and show them the corresponding raw logs. The AI's reasoning is verifiable.
 
 ### 5. Show them the agent decision flow
-Mention that the orchestrator window logs each LangGraph node executing:
+Mention that the orchestrator window logs each LangGraph node executing. For a failed order:
 ```
 INFO Node: classify_intent
 INFO Node: fetch_order_status
 INFO Node: analyze_logs
 INFO Node: find_similar_incidents
 INFO Node: synthesize_rca
+```
+
+For a successful order it short-circuits after log retrieval:
+```
+INFO Node: classify_intent
+INFO Node: fetch_order_status
+INFO Node: analyze_logs
+INFO Node: happy_path_summary
 ```
 
 This isn't a black box — every step is observable and debuggable.
@@ -781,13 +871,161 @@ When you next walk into the client meeting, you're not pitching theory — you'r
 
 ---
 
+## Frequently Asked Questions
+
+### Are we using RAG anywhere?
+
+Yes — the `ORDER_INQUIRY` flow is a **RAG (Retrieval-Augmented Generation) pipeline**. RAG means the LLM's response is grounded in documents retrieved at query time rather than relying solely on its training data.
+
+There are three retrieval steps before the LLM generates anything:
+
+| Step | What is retrieved | How |
+|------|------------------|-----|
+| `fetch_order_status` | Structured order, payment and shipment data | SQL JOIN on Postgres |
+| `analyze_logs` | Relevant log chunks for the order | Hard filter by `order_no` on OpenSearch |
+| `find_similar_incidents` | Past RCAs with similar symptoms | **Full-text DQL search** (`multi_match`) on OpenSearch |
+
+All three results are injected into the synthesis prompt (**Augment**), and only then does the LLM produce the RCA (**Generate**). The prompt explicitly forbids speculation:
+
+```
+STRICT RULES:
+- Use ONLY facts present in the evidence above.
+- If evidence is insufficient for any section, write "Insufficient evidence for [X]" instead of speculating.
+```
+
+This is what prevents hallucination — the LLM acts as a reasoning engine over retrieved facts, not a knowledge source.
+
+---
+
+### What happens when a business user asks in plain English with no technical terms?
+
+Example: *"customers are complaining orders are slow"*
+
+The `find_similar` node handles this with **LLM-based keyword expansion**. Before querying OpenSearch, it calls the router LLM (`qwen2.5:3b`) with a prompt that asks it to convert the business description into technical search terms:
+
+```
+"customers are complaining orders are slow"
+    ↓  qwen2.5:3b keyword expansion
+"timeout latency slow response connection pool circuit breaker high response time"
+    ↓  multi_match DQL
+incidents: payment gateway timeouts, HikariCP pool exhaustion, ...
+```
+
+This only triggers when no error log text is available to use as the search signal. When error chunks exist, the actual error message text is used directly — keyword expansion is skipped.
+
+---
+
+### Why does the system show executed steps instead of an RCA for some orders?
+
+When an order's logs contain no ERROR-level events, the flow short-circuits after `analyze_logs`:
+
+| Condition | Path | Output |
+|---|---|---|
+| Logs found with errors | `find_similar` → `synthesize_rca` | Structured RCA (LLM) |
+| Logs found, no errors | `happy_path_summary` | Executed steps (programmatic, no LLM) |
+| No logs at all | `find_similar` → `synthesize_rca` | "Insufficient evidence" message |
+
+The executed-steps formatter reads directly from structured log chunk data — timestamps, services, log lines — so there is no hallucination risk.
+
+---
+
+### Are embeddings generated by a separate model or does OpenSearch generate them?
+
+**Embeddings are no longer used — this project was updated to use DQL full-text search instead.**
+
+OpenSearch never generates embeddings itself; it is a search and storage engine only. The original design used `BAAI/bge-large-en-v1.5` (via `sentence-transformers`) to produce 1024-dim vectors stored in a k-NN HNSW index. That approach was replaced because log errors have precise, distinctive vocabulary (`HikariCP`, `NullPointerException`, `CannotGetJdbcConnectionException`) where BM25 term matching is more reliable and predictable than cosine similarity — and it removes ~3 GB of dependencies.
+
+The current flow for `find_similar_incidents` is:
+
+```
+User message / error chunk text
+    ↓
+multi_match DQL query           ← BM25 scoring across summary, root_cause, resolution, keywords
+    ↓ matching incident docs (ranked by relevance)
+LLM synthesis prompt            ← incidents injected as context
+```
+
+OpenSearch's role is now **full-text search and filtering** — no vectors, no HNSW, no cosine similarity.
+
+---
+
+### How does log ingestion, search, and LLM work end-to-end?
+
+#### Log ingestion (`services/ingestor/ingestor.py`)
+
+1. Kafka messages are consumed, parsed, and grouped by `trace_id` into 60-second time windows
+2. Each `LogChunk` gets a `composed_text` — a human-readable multi-line string:
+   ```
+   [11:38:48] [order-service] ERROR: Failed to obtain JDBC Connection | exception: ...
+   ```
+3. Flushes trigger two ways — a **background periodic task** every 30 seconds, and a **message-triggered flush** when 500 logs are buffered. Both drain chunks whose 60-second window has elapsed
+4. Chunks are bulk-indexed to OpenSearch with deterministic IDs (idempotent re-runs)
+
+No embedding model is involved — `composed_text` is stored as a plain `text` field and searched by BM25.
+
+---
+
+#### How search works in OpenSearch
+
+**Tool 1 — `analyze_order_logs` on `logs-vectors-current`**
+
+DQL `bool` query — `order_no` filter is a hard constraint, `should` clauses rank within results:
+```json
+{
+  "query": {
+    "bool": {
+      "filter": [{ "term": { "order_no": "ORD-00175" } }],
+      "should": [
+        { "term":  { "has_error": { "value": true,  "boost": 1.5 } } },
+        { "match": { "message":   { "query": "<context>", "boost": 2.0 } } }
+      ]
+    }
+  },
+  "sort": [{ "earliest_ts": "asc" }]
+}
+```
+
+**Tool 3 — `find_similar_incidents` on `incidents-historical`**
+
+`multi_match` with field boosting and fuzzy matching — no vectors:
+```json
+{
+  "query": {
+    "bool": {
+      "should": [
+        { "multi_match": { "query": "<description>",
+            "fields": ["summary^3", "root_cause^2", "resolution^1"],
+            "fuzziness": "AUTO", "minimum_should_match": "30%" } },
+        { "match": { "keywords": { "query": "<description>", "boost": 1.5 } } }
+      ]
+    }
+  }
+}
+```
+
+---
+
+#### Which LLM is used
+
+Two separate LLM roles, both served by Ollama locally:
+
+| Role | Model | Config |
+|---|---|---|
+| **Router / Intent Classifier** | `qwen2.5:3b` | `temperature=0.0` — classifies into ORDER_INQUIRY / STATUS_ONLY / GENERAL_QUESTION / CLARIFICATION |
+| **RCA Synthesizer** | `qwen2.5:7b` | `temperature=0.2` — generates the full structured RCA from retrieved evidence |
+
+Both use `ChatOllama` from `langchain_ollama` (`services/orchestrator/main.py`).
+
+**For production**: replace `ChatOllama` with `ChatAnthropic` — one line change. Target models: `claude-sonnet-4-5` (synthesis) and `claude-haiku-4-5` (routing).
+
+---
+
 ## License & Credits
 
 - **OpenSearch** — Apache 2.0
 - **Apache Kafka** — Apache 2.0
 - **PostgreSQL** — PostgreSQL License
 - **Redis** — BSD 3-Clause
-- **bge-large-en-v1.5** (BAAI) — MIT
 - **Qwen 2.5** (Alibaba) — Apache 2.0 (with use-case restrictions for enterprises >100M MAU)
 - **LangGraph / LangChain** — MIT
 - **FastAPI** — MIT
@@ -798,4 +1036,4 @@ All components are production-friendly licenses. Verify any commercial restricti
 
 ---
 
-*Last updated: May 2026. This document is a living reference — update as the POC evolves.*
+*Last updated: June 2026. This document is a living reference — update as the POC evolves.*

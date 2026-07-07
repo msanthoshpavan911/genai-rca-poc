@@ -38,22 +38,22 @@ function Write-Err($msg)     { Write-Host "[FAIL] $msg" -ForegroundColor Red }
 # -----------------------------------------------------------------------------
 # Find Python: prefer 'py' (Windows Python launcher), fall back to 'python'
 # -----------------------------------------------------------------------------
-function Get-Python {
+function Get-PythonExe {
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        return @("py", "-3")
+        return "py"
     } elseif (Get-Command python -ErrorAction SilentlyContinue) {
-        return @("python")
+        return "python"
     } else {
         Write-Err "Python not found. Install from https://www.python.org/downloads/"
         exit 1
     }
 }
 
-$PythonCmd = Get-Python
+$PythonExe = Get-PythonExe
 
 function Invoke-Python {
-    param([string[]]$Args)
-    & $PythonCmd[0] $PythonCmd[1..($PythonCmd.Length - 1)] @Args
+    param([string[]]$PythonArgs)
+    & $PythonExe @PythonArgs
 }
 
 # -----------------------------------------------------------------------------
@@ -177,8 +177,7 @@ function Cmd-GenerateBurst {
 }
 
 function Cmd-Ingest {
-    Write-Info "Starting Kafka -> embeddings -> OpenSearch ingestor..."
-    Write-Warn "First run will download bge-large-en-v1.5 (about 1.3 GB). Be patient."
+    Write-Info "Starting Kafka -> OpenSearch ingestor..."
     Push-Location "$RepoRoot\services\ingestor"
     try {
         Invoke-Python @("ingestor.py")

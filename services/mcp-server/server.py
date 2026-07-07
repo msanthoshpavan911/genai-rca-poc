@@ -11,7 +11,7 @@ unchanged.
 Tools:
   1. analyze_order_logs    -- hard filter on order_no (POC-simple, reliable)
   2. get_order_status      -- SQL JOIN on orders/payments/shipments
-  3. find_similar_incidents -- k-NN on incidents-historical
+  3. find_similar_incidents -- DQL multi_match on incidents-historical
 
 Run:
     uvicorn server:app --port 8001 --reload
@@ -25,8 +25,6 @@ import asyncpg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from opensearchpy import AsyncOpenSearch
-
-from embedding import embed_one
 
 
 # =============================================================================
@@ -122,8 +120,6 @@ async def lifespan(app: FastAPI):
         use_ssl=False, verify_certs=False,
     )
     app.state.pool = await asyncpg.create_pool(POSTGRES_DSN, min_size=2, max_size=10)
-    # Pre-warm the embedding model
-    embed_one("warmup")
     yield
     await app.state.os.close()
     await app.state.pool.close()
@@ -146,18 +142,27 @@ async def healthz():
 @app.post("/tools/analyze_order_logs", response_model=AnalyzeLogsResponse)
 async def analyze_order_logs(req: AnalyzeLogsRequest):
     """
-    POC version: hard filter on order_no.
+    DQL search: hard filter on order_no ensures we only see that order's logs.
+    When additional_context is provided, should clauses boost chunks whose
+    message text matches the query terms and chunks that contain errors —
+    so the most relevant evidence surfaces first within the top_k window.
     Returns log evidence, NOT analysis. The LLM does the reasoning.
-
-    Production version would add hybrid BM25 + k-NN scoring on top of the
-    order_no filter for semantic relevance ranking, but for a POC the simple
-    filter gives us every log we have for the order, which is what matters.
     """
+    should_clauses = [
+        # Always prefer error chunks
+        {"term": {"has_error": {"value": True, "boost": 1.5}}},
+    ]
+    if req.additional_context:
+        should_clauses.append(
+            {"match": {"message": {"query": req.additional_context, "boost": 2.0}}}
+        )
+
     body = {
         "size": req.top_k,
         "query": {
             "bool": {
-                "filter": [{"term": {"order_no": req.order_no}}]
+                "filter": [{"term": {"order_no": req.order_no}}],
+                "should": should_clauses,
             }
         },
         "sort": [{"earliest_ts": "asc"}],
@@ -239,19 +244,38 @@ async def get_order_status(req: OrderStatusRequest):
 # =============================================================================
 @app.post("/tools/find_similar_incidents", response_model=SimilarIncidentsResponse)
 async def find_similar_incidents(req: SimilarIncidentsRequest):
-    """k-NN search on historical RCAs."""
+    """Full-text DQL search on historical RCAs using multi_match + keyword boost."""
     try:
         await app.state.os.indices.get(index=INCIDENTS_INDEX)
     except Exception:
-        # If index doesn't exist yet, return empty gracefully
         return SimilarIncidentsResponse(incidents=[])
 
-    query_vector = embed_one(req.description)
     body = {
         "size": req.top_k,
         "query": {
-            "knn": {"embedding": {"vector": query_vector, "k": req.top_k}}
-        }
+            "bool": {
+                "should": [
+                    {
+                        "multi_match": {
+                            "query": req.description,
+                            "fields": ["summary^3", "root_cause^2", "resolution^1"],
+                            "type": "best_fields",
+                            "fuzziness": "AUTO",
+                            "minimum_should_match": "30%",
+                        }
+                    },
+                    {
+                        "match": {
+                            "keywords": {
+                                "query": req.description,
+                                "boost": 1.5,
+                            }
+                        }
+                    },
+                ],
+                "minimum_should_match": 1,
+            }
+        },
     }
     resp = await app.state.os.search(index=INCIDENTS_INDEX, body=body)
     incidents = [
@@ -289,7 +313,7 @@ async def list_tools():
             {
                 "name": "find_similar_incidents",
                 "path": "/tools/find_similar_incidents",
-                "description": "Find historically similar resolved incidents via vector search.",
+                "description": "Find historically similar resolved incidents via full-text search.",
                 "input_schema": SimilarIncidentsRequest.model_json_schema(),
             },
         ]

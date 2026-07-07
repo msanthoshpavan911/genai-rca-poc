@@ -10,7 +10,7 @@ swapped for **Ollama** running locally; everything else is production-identical.
 
 1. **Spring Boot → Kafka → OpenSearch** pipeline (mocked with a Python log generator)
 2. **Parallel Python ingestor** consuming Kafka with its own consumer group
-3. **Vector embeddings** (bge-large-en-v1.5) written to OpenSearch k-NN
+3. **Full-text log search** (DQL/BM25 on OpenSearch — no embeddings, no vector index)
 4. **MCP server** with 3 tools (analyze_order_logs, get_order_status, find_similar_incidents)
 5. **LangGraph agent** that classifies intent and orchestrates tool calls
 6. **Local LLM** (Ollama with Qwen 2.5) for RCA synthesis
@@ -165,13 +165,13 @@ make ui                    # OR serve the React UI at http://localhost:3000/inde
 Open Kafka UI: http://localhost:8080
 → Navigate to Topics → `app-logs` → Messages
 
-### Check OpenSearch has vectors
+### Check OpenSearch has indexed log chunks
 ```bash
 curl 'http://localhost:9200/logs-vectors-current/_count'
 # Expect: {"count": ~50-200, ...}
 
 curl 'http://localhost:9200/logs-vectors-current/_search?size=1&pretty'
-# Should show a document with embedding field
+# Should show a document with a composed_text / message field (plain text, no embedding vector)
 ```
 
 Or use OpenSearch Dashboards: http://localhost:5601
@@ -224,6 +224,23 @@ Order numbers from `ORD-00001` to `ORD-00200` are seeded with realistic data.
 
 ---
 
+## How RAG Works Here
+
+This is a Retrieval-Augmented Generation pipeline using **full-text search, not vector search**:
+
+1. **Retrieve** — three tools gather evidence before any generation:
+   - `get_order_status` — SQL JOIN on Postgres (orders/payments/shipments)
+   - `analyze_order_logs` — OpenSearch DQL, hard `term` filter on `order_no`, boosted by `has_error`
+   - `find_similar_incidents` — OpenSearch DQL `multi_match` (BM25) across past RCA summaries
+2. **Augment** — retrieved evidence is labeled (timestamps, services, error lines) and injected into the synthesis prompt.
+3. **Generate** — the LLM (`qwen2.5:7b` via Ollama) writes the RCA using *only* the injected evidence, and must say "insufficient evidence" rather than speculate.
+
+No embedding model or vector index is used — log error text (`HikariCP`, `NullPointerException`, etc.) has distinctive enough vocabulary that BM25 term matching outperforms semantic similarity here, and it avoids ~3 GB of extra dependencies. If a query's logs contain no errors, the flow skips the LLM entirely and returns a deterministic step summary instead — zero hallucination risk on the happy path.
+
+See `docs/PROJECT_DOCUMENTATION.md` for the full breakdown.
+
+---
+
 ## Architecture Recap
 
 ```
@@ -235,7 +252,7 @@ Order numbers from `ORD-00001` to `ORD-00200` are seeded with realistic data.
 │      Kafka                    │                                │
 │   (app-logs)                  │                                │
 │    │       │                  │                                │
-│    │       └──► Ingestor (Python) ──► OpenSearch k-NN          │
+│    │       └──► Ingestor (Python) ──► OpenSearch (DQL/BM25)    │
 │    │                                  (logs-vectors-*)          │
 │    │                                       │                    │
 │    └──► (Logstash — skipped for POC)       │                   │
@@ -268,11 +285,10 @@ genai-rca-poc/
 │   │   ├── generate_logs.py        # Mock Spring Boot logs → Kafka
 │   │   └── requirements.txt
 │   ├── ingestor/
-│   │   ├── ingestor.py             # Kafka → embeddings → OpenSearch
+│   │   ├── ingestor.py             # Kafka → OpenSearch (DQL full-text)
 │   │   └── requirements.txt
 │   ├── mcp-server/
 │   │   ├── server.py               # 3 tools as HTTP endpoints
-│   │   ├── embedding.py            # Shared bge-large wrapper
 │   │   └── requirements.txt
 │   ├── orchestrator/
 │   │   ├── main.py                 # FastAPI + LangGraph + Ollama
@@ -320,9 +336,6 @@ docker compose -f infra/docker-compose.yml logs
 ### `make smoke` shows Kafka unreachable
 Wait 30 seconds after `make up` — Kafka takes time to be ready.
 
-### Ingestor crashes on first run
-First time loading `bge-large-en-v1.5` downloads ~1.3 GB. Be patient — subsequent runs are instant.
-
 ### Ollama "model not found"
 ```bash
 ollama list  # check what you have
@@ -333,9 +346,10 @@ ollama pull qwen2.5:7b
 First LLM call loads the model into RAM (~5 GB). Subsequent calls are fast.
 Watch the Ollama logs: `journalctl -u ollama -f` or check Ollama's terminal output.
 
-### OpenSearch returns 0 results from k-NN
+### OpenSearch returns 0 results from analyze_order_logs
 1. Verify ingestor has run successfully and `_count` > 0 on the index
 2. Refresh the index: `curl -X POST http://localhost:9200/logs-vectors-current/_refresh`
+3. Confirm the `order_no` you're querying actually exists in the index (see the aggregation query in `docs/PROJECT_DOCUMENTATION.md`)
 
 ### React UI shows "Error: failed to fetch"
 The orchestrator probably isn't running on port 8000. Check with `make smoke`.
@@ -369,7 +383,6 @@ Once the basic POC works, try:
 |---|---|
 | Docker | $0 |
 | Kafka, OpenSearch, Postgres, Redis | $0 |
-| bge-large-en-v1.5 model | $0 |
 | Ollama + Qwen 2.5 | $0 |
 | LangGraph, FastAPI, React | $0 |
 | **Total** | **$0** |
