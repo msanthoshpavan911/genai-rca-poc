@@ -20,11 +20,6 @@ data/
 *.log
 *.sqlite
 
-# Model cache (bge-large is ~1.3 GB; don't commit)
-.cache/
-models/
-sentence-transformers/
-
 # Env files
 .env
 .env.local

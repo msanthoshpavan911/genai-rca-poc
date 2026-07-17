@@ -48,6 +48,60 @@
         align-items: center;
       }
       .status { font-size: 12px; opacity: 0.85; }
+      .header-right {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .project-badge {
+        font-size: 12px;
+        font-weight: 400;
+        background: rgba(255,255,255,0.15);
+        padding: 4px 10px;
+        border-radius: 12px;
+      }
+      .new-session-btn {
+        background: transparent;
+        border: 1px solid rgba(255,255,255,0.5);
+        color: #fff;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 400;
+        cursor: pointer;
+      }
+      .new-session-btn:hover { background: rgba(255,255,255,0.15); }
+      .picker {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        text-align: center;
+        gap: 18px;
+      }
+      .picker h1 { font-size: 22px; margin: 0; }
+      .picker p { color: #555; margin: 0; max-width: 420px; }
+      .picker-options {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        width: 100%;
+        max-width: 320px;
+      }
+      .picker-option {
+        background: #fff;
+        border: 1px solid var(--border);
+        padding: 14px 18px;
+        border-radius: 10px;
+        font-size: 14px;
+        cursor: pointer;
+        text-align: left;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+      }
+      .picker-option:hover { border-color: var(--primary); background: #EAF2F8; }
+      .picker-error { color: #B3261E; font-size: 13px; }
       main {
         flex: 1;
         overflow-y: auto;
@@ -171,10 +225,86 @@
           .replace(/^(\d+)\. (.+)$/gm, "$1. $2");
       }
 
+      function newSessionId() {
+        return (crypto.randomUUID ? crypto.randomUUID() : `sess-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      }
+
+      // Project selection screen — shown before the chat interface. The
+      // choice made here is locked for the rest of the session; switching
+      // projects means starting a new session (see "New session" in header).
+      function ProjectPicker({ onSelect }) {
+        const [projects, setProjects] = useState(null);
+        const [error, setError] = useState("");
+
+        useEffect(() => {
+          fetch("http://localhost:8000/api/v1/projects")
+            .then(r => r.json())
+            .then(data => setProjects(data.projects || []))
+            .catch(e => setError(`Could not load projects: ${e.message}. Is the orchestrator running on :8000?`));
+        }, []);
+
+        return (
+          <div className="picker">
+            <h1>👋 Welcome to the GenAI RCA Assistant</h1>
+            <p>
+              I can look up logs for a specific order, explain what happened, and — if
+              something failed — walk you through a root cause analysis. To start,
+              pick which project's logs you'd like to ask about. This stays fixed for
+              the rest of this conversation.
+            </p>
+            {error && <div className="picker-error">{error}</div>}
+            {!error && !projects && <div className="thinking">Loading projects…</div>}
+            {projects && projects.length === 0 && (
+              <div className="picker-error">No projects configured on the server.</div>
+            )}
+            <div className="picker-options">
+              {projects && projects.map(p => (
+                <div
+                  key={p.project_id}
+                  className="picker-option"
+                  onClick={() => onSelect(p)}
+                >
+                  {p.display_name}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      }
+
+      const PERSONAS = [
+        { id: "technical", label: "Technical consultant", hint: "Stack traces, exception names, infrastructure detail" },
+        { id: "business", label: "Business user", hint: "Plain-language impact, no jargon" },
+      ];
+
+      // Persona selection screen — shown after a project is picked, before
+      // entering chat. Also locked for the session: it controls whether the
+      // RCA is written in engineering terms or plain-language business terms.
+      function PersonaPicker({ projectName, onSelect }) {
+        return (
+          <div className="picker">
+            <h1>One more thing</h1>
+            <p>
+              For <strong>{projectName}</strong> — how would you like RCA explanations written?
+              You can start a new session later to switch.
+            </p>
+            <div className="picker-options">
+              {PERSONAS.map(p => (
+                <div key={p.id} className="picker-option" onClick={() => onSelect(p.id)}>
+                  <div>{p.label}</div>
+                  <div style={{ fontSize: "12px", color: "#888", marginTop: "2px" }}>{p.hint}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      }
+
       function App() {
-        const [messages, setMessages] = useState([
-          { role: "system", content: "Welcome! Ask me about any order (e.g., 'Why did ORD-00005 fail?')" }
-        ]);
+        const [project, setProject] = useState(null);
+        const [persona, setPersona] = useState(null);
+        const [sessionId, setSessionId] = useState(newSessionId());
+        const [messages, setMessages] = useState([]);
         const [input, setInput] = useState("");
         const [loading, setLoading] = useState(false);
         const scrollRef = useRef(null);
@@ -183,8 +313,31 @@
           if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
         }, [messages]);
 
+        function selectProject(p) {
+          setProject(p);
+        }
+
+        function selectPersona(personaId) {
+          setPersona(personaId);
+          const label = PERSONAS.find(p => p.id === personaId)?.label || personaId;
+          setMessages([
+            {
+              role: "system",
+              content: `You're now asking about **${project.display_name}**, explained for a **${label}**. Try: "Why did ORD-00005 fail?" or "What is the status of ORD-00100?"`,
+            },
+          ]);
+        }
+
+        function newSession() {
+          setProject(null);
+          setPersona(null);
+          setSessionId(newSessionId());
+          setMessages([]);
+          setInput("");
+        }
+
         async function send(text) {
-          if (!text.trim() || loading) return;
+          if (!text.trim() || loading || !project || !persona) return;
           setMessages(m => [...m, { role: "user", content: text }]);
           setInput("");
           setLoading(true);
@@ -194,10 +347,15 @@
             const resp = await fetch("http://localhost:8000/api/v1/chat", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: text, session_id: "default" }),
+              body: JSON.stringify({
+                message: text,
+                session_id: sessionId,
+                project_id: project.project_id,
+                persona: persona,
+              }),
             });
             const data = await resp.json();
-            const trace = `Intent: ${data.intent} | Order: ${data.order_no || "n/a"} | Evidence: ${data.evidence_count} log chunks`;
+            const trace = `Intent: ${data.intent} | Order: ${data.order_no || "n/a"} | Evidence: ${data.evidence_count} log chunks${data.is_rca ? " | RCA" : ""}`;
             setMessages(m => [
               ...m.slice(0, -1),
               { role: "bot", content: data.response, trace },
@@ -212,10 +370,22 @@
           }
         }
 
+        if (!project) {
+          return <ProjectPicker onSelect={selectProject} />;
+        }
+        if (!persona) {
+          return <PersonaPicker projectName={project.display_name} onSelect={selectPersona} />;
+        }
+
         return (
           <>
             <header>
-              <div>🤖 GenAI RCA Chatbot (POC)</div>
+              <div>🤖 GenAI RCA Chatbot</div>
+              <div className="header-right">
+                <span className="project-badge">{project.display_name}</span>
+                <span className="project-badge">{PERSONAS.find(p => p.id === persona)?.label}</span>
+                <button className="new-session-btn" onClick={newSession}>New session</button>
+              </div>
             </header>
             <div className="examples">
               {EXAMPLES.map((q, i) => (

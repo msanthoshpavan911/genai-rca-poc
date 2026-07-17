@@ -9,6 +9,7 @@ Usage:
 
 import asyncio
 import os
+from datetime import datetime, timezone
 
 from opensearchpy import AsyncOpenSearch, helpers
 
@@ -88,6 +89,13 @@ INDEX_BODY = {
             "root_cause":  {"type": "text"},
             "resolution":  {"type": "text"},
             "keywords":    {"type": "text"},   # text so multi_match can search it
+            "order_no":    {"type": "keyword"},
+            "project_id":  {"type": "keyword"},
+            # "curated" = hand-written seed data below; "auto-generated" =
+            # written back by the orchestrator's save_incident node after a
+            # real chatbot/poller RCA completes.
+            "source":      {"type": "keyword"},
+            "created_at":  {"type": "date"},
         }
     },
 }
@@ -108,13 +116,17 @@ async def main():
     await client.indices.create(index=INDEX_NAME, body=INDEX_BODY)
     print(f"✅ Created index {INDEX_NAME}")
 
-    # Bulk index (no embeddings — DQL full-text search used at query time)
+    # Bulk index (no embeddings — DQL full-text search used at query time).
+    # Tagged "curated" here (rather than in each INCIDENTS dict) so it's one
+    # place to distinguish this vetted seed data from auto-generated entries
+    # the orchestrator writes back after a real RCA (see save_incident).
+    now = datetime.now(timezone.utc).isoformat()
     actions = [
         {
             "_op_type": "index",
             "_index": INDEX_NAME,
             "_id": inc["incident_id"],
-            "_source": inc,
+            "_source": {**inc, "source": "curated", "created_at": now},
         }
         for inc in INCIDENTS
     ]

@@ -41,6 +41,15 @@ SYNTHESIS_MODEL  = os.getenv("SYNTHESIS_MODEL", "qwen2.5:7b")
 ROUTER_MODEL     = os.getenv("ROUTER_MODEL", "qwen2.5:3b")
 REDIS_URL        = os.getenv("REDIS_URL", "redis://localhost:6379")
 
+# Used when the client doesn't yet send a project_id (e.g. old curl demos).
+# Module 4 (chat UI) is expected to make project selection explicit per session.
+DEFAULT_PROJECT_ID = os.getenv("DEFAULT_PROJECT_ID", "app_launchpad")
+
+# Persona picked in the chat UI, locked for the session (Module 4/5). Only
+# changes wording/detail level in the RCA — never the section structure, so
+# _parse_rca_sections (write-back) keeps working regardless of persona.
+DEFAULT_PERSONA = "technical"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orchestrator")
 
@@ -48,6 +57,24 @@ log = logging.getLogger("orchestrator")
 # =============================================================================
 # PROMPTS
 # =============================================================================
+PERSONA_INSTRUCTIONS = {
+    "technical": (
+        "AUDIENCE: a technical/SRE consultant. Use precise technical language — exception "
+        "class names, stack trace details, service/component names, and infrastructure terms "
+        "(connection pools, circuit breakers, HTTP status codes, cache TTLs, etc). Assume the "
+        "reader can act directly on engineering-level detail."
+    ),
+    "business": (
+        "AUDIENCE: a business user with no technical background. Do NOT use stack traces, "
+        "exception class names, or infrastructure jargon in the main narrative (e.g. instead "
+        "of 'HikariCP connection pool exhausted', say 'the system couldn't connect to the "
+        "database in time'). Focus on customer/business impact: what broke, who or what was "
+        "affected, and what is being done about it, in plain English a non-engineer can "
+        "follow. Technical specifics may still appear in the Evidence section since that is "
+        "meant to be a literal citation of the logs, not prose."
+    ),
+}
+
 KEYWORD_EXPANSION_PROMPT = """You are a technical search assistant helping find similar past incidents in a microservice order-management system.
 
 Convert the business description below into technical search keywords. Think about: Java exception names, Spring Boot concepts, infrastructure components (HikariCP, Redis, Kafka, PSP gateway), HTTP status codes, and performance terms.
@@ -73,6 +100,8 @@ Classification:"""
 
 RCA_SYNTHESIS_PROMPT = """You are a senior Site Reliability Engineer reviewing order activity.
 
+{persona_instructions}
+
 ORDER STATUS (from database):
 {order_status}
 
@@ -82,9 +111,7 @@ LOG EVIDENCE:
 SIMILAR PAST INCIDENTS:
 {similar_incidents}
 
-Look at the log evidence. Decide:
-- If ERROR-level logs are present → write a Root Cause Analysis using FORMAT A below.
-- If only INFO/WARN logs are present (no ERROR) → write an Order Summary using FORMAT B below.
+{format_directive}
 
 Output exactly ONE format. Do not output both. Do not repeat sections. Do not include these instructions in your answer.
 
@@ -113,24 +140,39 @@ Pre-existing conditions that worsened the failure. Write "Insufficient evidence"
 Consolidated bullet list of the specific log lines (timestamp + service + message) that support this analysis.
 
 =========================
-FORMAT B — Order Summary
+FORMAT B — Insufficient Evidence
 =========================
 
 **Summary**
-One or two sentences confirming the order completed successfully.
+One or two sentences stating that no log evidence was found for this entity in the searched time window.
 
 **What Happened**
-Factual timeline from the logs. Cite specific timestamps and service names.
+State plainly that no log evidence was available to reconstruct a timeline. Do not speculate or fabricate a sequence of events.
 
 **Evidence**
-Bullet list of the key log lines that confirm successful completion.
+Write "No log evidence found."
 
 ==============================
 RULES:
 - Output only the chosen format — no headers like "STEP 1", "FORMAT A", "IF ERRORS", etc.
+- Do not add any title or heading before **Summary** (e.g. do NOT write "Order Summary" or
+  "Root Cause Analysis" as a leading line) — the response must begin directly with **Summary**.
 - Use only facts from the log evidence. Never fabricate failures not present in the logs.
+- A single ERROR anywhere in the evidence means FORMAT A applies to the whole response, even if
+  other parts of the same order completed successfully (e.g. payment captured but shipping
+  failed is still a failure requiring root cause analysis — do not downgrade it to a summary
+  just because some steps succeeded).
 - If the same root cause appears across multiple transactions, state it once.
 - Cite timestamps and service names directly from the evidence.
+- If a transaction is marked with a "⚠ Only one service present" coverage warning,
+  treat it as a partial slice of the request, not the complete picture. Do not assert
+  a definitive single-service root cause from it alone — say the evidence appears
+  incomplete and name what's missing (e.g. "no downstream service logs correlated to
+  this request") rather than guessing what happened elsewhere.
+- The audience instructions above govern WORDING and level of technical detail only.
+  Always keep the exact section headers (**Summary**, **What Happened**, **Root Cause**,
+  **Contributing Factors**, **Recommended Actions**, **Evidence**) as given — never rename,
+  merge, or drop them regardless of audience.
 """
 
 
@@ -140,12 +182,15 @@ RULES:
 class AgentState(TypedDict):
     user_message: str
     session_id: str
+    project_id: str
+    persona: str
     order_no: Optional[str]
     intent: Optional[str]
     order_status: Optional[Dict]
     log_evidence: Optional[Dict]
     similar_incidents: Optional[List[Dict]]
     response: Optional[str]
+    rca_sections: Optional[Dict[str, str]]
 
 
 # =============================================================================
@@ -242,6 +287,7 @@ async def analyze_logs(state: AgentState) -> AgentState:
         return state
     try:
         result = await call_mcp("/tools/analyze_order_logs", {
+            "project_id": state["project_id"],
             "order_no": state["order_no"],
             "additional_context": state["user_message"],
             "top_k": 20,
@@ -295,7 +341,13 @@ async def find_similar(state: AgentState) -> AgentState:
 def _format_evidence(chunks: list) -> str:
     """Format log chunks into clearly separated transactions with error highlights.
     Pre-extracting errors per chunk prevents the LLM from conflating multiple
-    distinct failure scenarios into a single incorrect narrative."""
+    distinct failure scenarios into a single incorrect narrative.
+
+    Production logs are correlated by loggingId, which is not guaranteed to
+    propagate across every service hop (unlike the POC's synthetic trace_id).
+    A chunk touching only one service may be a partial slice of a larger
+    failure, not the whole story — flagged here so the synthesis prompt can
+    hedge instead of asserting a confident single-service root cause."""
     if not chunks:
         return "No log evidence found."
 
@@ -309,10 +361,19 @@ def _format_evidence(chunks: list) -> str:
             "\n".join(f"    • {l}" for l in error_lines)
         ) if error_lines else "  No errors — all steps completed successfully."
 
+        services = c.get("services", [])
+        partial_flag = (
+            "\nCoverage   : ⚠ Only one service present — this may be a PARTIAL "
+            "trace if the correlation ID didn't propagate across every service "
+            "involved. Do not assume this is the full request lifecycle."
+            if len(services) <= 1 else ""
+        )
+
         sections.append(
             f"--- TRANSACTION {i} ---\n"
             f"Time range : {c.get('earliest_ts', '')[:19]} → {c.get('latest_ts', '')[:19]}\n"
-            f"Services   : {', '.join(c.get('services', []))}\n"
+            f"Services   : {', '.join(services)}"
+            f"{partial_flag}\n"
             f"Has errors : {c.get('has_error', False)}\n"
             f"{error_summary}\n\n"
             f"Full log:\n{c.get('message', '')}"
@@ -321,12 +382,41 @@ def _format_evidence(chunks: list) -> str:
     return "\n\n" + ("=" * 60 + "\n").join(sections)
 
 
+def _format_directive(chunks: list) -> str:
+    """Decide FORMAT A vs FORMAT B in code, not in the LLM's head.
+
+    synthesize_rca is only ever reached when chunks is non-empty with at
+    least one ERROR (route_after_logs already intercepted the "chunks exist,
+    no errors" case and sent it to the non-LLM happy_path_summary instead),
+    or when chunks is empty (no evidence found at all). Leaving this as an
+    LLM judgment call caused it to pick FORMAT B ("order completed
+    successfully") for orders that had a real ERROR alongside unrelated
+    successful steps (e.g. payment captured but shipping failed) — it was
+    weighing overall outcome instead of "was there a confirmed error." Since
+    we already know the answer from the MCP tool's has_error flag, just
+    tell it."""
+    if chunks:
+        return (
+            "The evidence below has already been confirmed programmatically to contain at least "
+            "one ERROR-level log entry. You MUST write FORMAT A — Root Cause Analysis — below. "
+            "This applies even if other parts of the same order completed successfully elsewhere "
+            "(e.g. payment captured despite a shipping failure) — any confirmed error requires a "
+            "full root cause analysis, never FORMAT B."
+        )
+    return (
+        "No log evidence was found for this entity in the searched time window. Write FORMAT B "
+        "below, stating plainly that evidence is insufficient — do not guess or fabricate a "
+        "timeline."
+    )
+
+
 async def synthesize_rca(state: AgentState) -> AgentState:
     """Build the prompt and let the LLM synthesize the RCA."""
     log.info("Node: synthesize_rca")
 
+    chunks = state.get("log_evidence", {}).get("log_chunks", [])
     status_str   = json.dumps(state.get("order_status", {"found": False}), indent=2)
-    evidence_str = _format_evidence(state.get("log_evidence", {}).get("log_chunks", []))
+    evidence_str = _format_evidence(chunks)
 
     incidents     = state.get("similar_incidents", [])
     incidents_str = "\n\n".join([
@@ -334,7 +424,12 @@ async def synthesize_rca(state: AgentState) -> AgentState:
         for i in incidents
     ]) or "No similar past incidents found."
 
+    persona = state.get("persona") or DEFAULT_PERSONA
+    persona_instructions = PERSONA_INSTRUCTIONS.get(persona, PERSONA_INSTRUCTIONS[DEFAULT_PERSONA])
+
     prompt = RCA_SYNTHESIS_PROMPT.format(
+        persona_instructions=persona_instructions,
+        format_directive=_format_directive(chunks),
         order_status=status_str,
         log_evidence=evidence_str,
         similar_incidents=incidents_str,
@@ -346,6 +441,53 @@ async def synthesize_rca(state: AgentState) -> AgentState:
         HumanMessage(content=prompt),
     ])
     state["response"] = result.content
+    return state
+
+
+def _parse_rca_sections(rca_text: str) -> Optional[Dict[str, str]]:
+    """Pull Summary/Root Cause/Recommended Actions out of the structured RCA
+    markdown (FORMAT A in RCA_SYNTHESIS_PROMPT) so it can be written back to
+    incidents-historical. Returns None if this isn't a real RCA (e.g. it's a
+    FORMAT B order summary with no root cause) — nothing to save in that case."""
+    if "**Root Cause**" not in rca_text:
+        return None
+
+    def _section(name: str) -> str:
+        pattern = rf"\*\*{re.escape(name)}\*\*\s*\n(.*?)(?=\n\*\*|\Z)"
+        m = re.search(pattern, rca_text, re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    return {
+        "summary": _section("Summary"),
+        "root_cause": _section("Root Cause"),
+        "resolution": _section("Recommended Actions"),
+    }
+
+
+async def save_incident(state: AgentState) -> AgentState:
+    """Push the completed RCA back into incidents-historical for future
+    find_similar_incidents lookups. A tracking side effect only — failures
+    here must never block the response already computed for the user.
+
+    Also stores the parsed sections on state as `rca_sections`, so callers
+    (the /api/v1/chat response, and later Module 3's poller) can tell a real
+    RCA apart from a happy-path/status response without re-parsing markdown."""
+    log.info("Node: save_incident")
+    sections = _parse_rca_sections(state.get("response", ""))
+    state["rca_sections"] = sections
+    if not sections:
+        return state
+    try:
+        await call_mcp("/tools/save_incident", {
+            "order_no": state.get("order_no"),
+            "project_id": state.get("project_id"),
+            "summary": sections["summary"],
+            "root_cause": sections["root_cause"],
+            "resolution": sections["resolution"],
+            "source": "auto-generated",
+        })
+    except Exception as e:
+        log.error(f"save_incident failed: {e}")
     return state
 
 
@@ -379,12 +521,17 @@ async def status_only_response(state: AgentState) -> AgentState:
 
 async def happy_path_summary(state: AgentState) -> AgentState:
     """Format executed steps for orders whose logs contain no errors.
-    Purely programmatic — no LLM involved, zero hallucination risk."""
+    Purely programmatic — no LLM involved, zero hallucination risk.
+
+    For the business persona, the raw per-line log dump (service names,
+    log levels, raw timestamps) is skipped in favor of a one-line plain
+    confirmation — that dump is only useful to a technical reader."""
     log.info("Node: happy_path_summary")
 
     order_no = state.get("order_no", "unknown")
     status   = state.get("order_status") or {}
     chunks   = state.get("log_evidence", {}).get("log_chunks", [])
+    persona  = state.get("persona") or DEFAULT_PERSONA
 
     lines = [f"**Order {order_no} — Executed Steps**\n"]
 
@@ -411,6 +558,11 @@ async def happy_path_summary(state: AgentState) -> AgentState:
     # ── Log timeline ────────────────────────────────────────────────────────
     if not chunks:
         lines.append("_No log evidence found for this order in the current index._")
+        state["response"] = "\n".join(lines)
+        return state
+
+    if persona == "business":
+        lines.append(f"✅ No issues found — {len(chunks)} transaction(s) completed without errors.")
         state["response"] = "\n".join(lines)
         return state
 
@@ -481,6 +633,7 @@ def build_graph():
     graph.add_node("happy_path_summary", happy_path_summary)
     graph.add_node("find_similar", find_similar)
     graph.add_node("synthesize", synthesize_rca)
+    graph.add_node("save_incident", save_incident)
     graph.add_node("fetch_status_only", fetch_order_status)
     graph.add_node("status_response", status_only_response)
     graph.add_node("clarify", clarify_response)
@@ -506,7 +659,8 @@ def build_graph():
     graph.add_edge("happy_path_summary", END)
 
     graph.add_edge("find_similar", "synthesize")
-    graph.add_edge("synthesize", END)
+    graph.add_edge("synthesize", "save_incident")
+    graph.add_edge("save_incident", END)
 
     graph.add_edge("fetch_status_only", "status_response")
     graph.add_edge("status_response", END)
@@ -547,11 +701,23 @@ async def _startup():
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
+    project_id: str = DEFAULT_PROJECT_ID
+    persona: str = DEFAULT_PERSONA
 
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/api/v1/projects")
+async def list_projects_for_ui():
+    """Passthrough to the MCP server's project list, so the chat UI only
+    ever talks to the orchestrator and never calls MCP directly."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{MCP_BASE_URL}/projects")
+        resp.raise_for_status()
+        return resp.json()
 
 
 @app.post("/api/v1/chat")
@@ -560,9 +726,12 @@ async def chat(req: ChatRequest):
     state = {
         "user_message": req.message,
         "session_id": req.session_id,
+        "project_id": req.project_id,
+        "persona": req.persona,
         "order_no": None, "intent": None,
         "order_status": None, "log_evidence": None,
         "similar_incidents": None, "response": None,
+        "rca_sections": None,
     }
     result = await agent.ainvoke(state)
     return {
@@ -570,6 +739,7 @@ async def chat(req: ChatRequest):
         "intent": result.get("intent"),
         "order_no": result.get("order_no"),
         "evidence_count": len(result.get("log_evidence", {}).get("log_chunks", [])) if result.get("log_evidence") else 0,
+        "is_rca": result.get("rca_sections") is not None,
     }
 
 
@@ -580,14 +750,18 @@ async def chat_stream(req: ChatRequest):
         state = {
             "user_message": req.message,
             "session_id": req.session_id,
+            "project_id": req.project_id,
+            "persona": req.persona,
             "order_no": None, "intent": None,
             "order_status": None, "log_evidence": None,
             "similar_incidents": None, "response": None,
+            "rca_sections": None,
         }
 
         yield f"data: {json.dumps({'type': 'start'})}\n\n"
 
         # Stream node-by-node updates
+        response_sent = False
         async for chunk in agent.astream(state):
             for node_name, node_state in chunk.items():
                 # Emit a progress event
@@ -601,10 +775,110 @@ async def chat_stream(req: ChatRequest):
                     )
                 yield f"data: {json.dumps(payload)}\n\n"
 
-                # When we reach a terminal node with a response, emit it
-                if node_state.get("response"):
-                    yield f"data: {json.dumps({'type': 'response', 'content': node_state['response']})}\n\n"
+                # Emit the response exactly once. synthesize sets it first, but
+                # the save_incident node runs after synthesize on the RCA path
+                # and still carries the same response forward — guard so the
+                # client doesn't receive it twice. is_rca is derived directly
+                # from the text (same check _parse_rca_sections uses) rather
+                # than from state["rca_sections"], since that field isn't
+                # populated yet at the point synthesize's response first appears.
+                if node_state.get("response") and not response_sent:
+                    response_sent = True
+                    is_rca = "**Root Cause**" in node_state["response"]
+                    yield f"data: {json.dumps({'type': 'response', 'content': node_state['response'], 'is_rca': is_rca})}\n\n"
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# =============================================================================
+# INTERNAL: proactive incident analysis (Module 3's poller entry point)
+# =============================================================================
+class AnalyzeIncidentRequest(BaseModel):
+    project_id: str
+    logging_id: str
+    # Proactive alerts default to the technical persona since they go to an
+    # engineering DL/Slack channel, not a live user who picked their own persona.
+    persona: str = DEFAULT_PERSONA
+
+
+@app.post("/api/v1/internal/analyze_incident")
+async def analyze_incident(req: AnalyzeIncidentRequest):
+    """Entry point for the proactive error poller: given a project and a
+    loggingId already known to contain a fresh ERROR (from find_new_errors),
+    fetch its full trace and run it through the exact same RCA synthesis
+    engine the chatbot uses (_format_evidence, RCA_SYNTHESIS_PROMPT,
+    _parse_rca_sections, save_incident) — reused unchanged, not duplicated.
+    There is no user_message or order_no here; this isn't a chat turn."""
+    log.info(f"Node: analyze_incident (proactive) project={req.project_id} loggingId={req.logging_id}")
+
+    try:
+        trace_resp = await call_mcp("/tools/get_trace_by_logging_id", {
+            "project_id": req.project_id,
+            "logging_id": req.logging_id,
+        })
+    except Exception as e:
+        log.error(f"get_trace_by_logging_id failed: {e}")
+        return {"response": "Could not retrieve trace.", "is_rca": False, "logging_id": req.logging_id}
+
+    if not trace_resp.get("found"):
+        return {"response": "Trace no longer available.", "is_rca": False, "logging_id": req.logging_id}
+
+    chunk = trace_resp["chunk"]
+    evidence_str = _format_evidence([chunk])
+
+    # No user question to search with — fall back to the raw error text
+    # itself, same as the chat flow's find_similar fallback when no
+    # error-bearing chunk is available to seed the description.
+    description = chunk["message"][:500]
+    try:
+        similar_resp = await call_mcp("/tools/find_similar_incidents", {
+            "description": description, "top_k": 3,
+        })
+        similar_incidents = similar_resp.get("incidents", [])
+    except Exception as e:
+        log.error(f"find_similar_incidents failed: {e}")
+        similar_incidents = []
+
+    incidents_str = "\n\n".join([
+        f"[{i['incident_id']}] {i['summary']}\nRoot Cause: {i['root_cause']}\nResolution: {i['resolution']}"
+        for i in similar_incidents
+    ]) or "No similar past incidents found."
+
+    persona_instructions = PERSONA_INSTRUCTIONS.get(req.persona, PERSONA_INSTRUCTIONS[DEFAULT_PERSONA])
+    prompt = RCA_SYNTHESIS_PROMPT.format(
+        persona_instructions=persona_instructions,
+        format_directive=_format_directive([chunk]),
+        order_status=json.dumps(
+            {"found": False, "note": "Proactively detected — no order lookup performed."}, indent=2
+        ),
+        log_evidence=evidence_str,
+        similar_incidents=incidents_str,
+    )
+
+    llm = get_synthesis_llm()
+    result = await llm.ainvoke([
+        SystemMessage(content="You are an expert SRE."),
+        HumanMessage(content=prompt),
+    ])
+    response_text = result.content
+
+    sections = _parse_rca_sections(response_text)
+    if sections:
+        try:
+            await call_mcp("/tools/save_incident", {
+                "project_id": req.project_id,
+                "summary": sections["summary"],
+                "root_cause": sections["root_cause"],
+                "resolution": sections["resolution"],
+                "source": "proactive-alert",
+            })
+        except Exception as e:
+            log.error(f"save_incident failed: {e}")
+
+    return {
+        "response": response_text,
+        "is_rca": sections is not None,
+        "logging_id": req.logging_id,
+    }

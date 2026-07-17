@@ -1,272 +1,91 @@
-# GenAI Log Analysis & RCA Chatbot — Local POC
+# GenAI Log Analysis & RCA Assistant
 
-A complete, **zero-cost, runs-on-your-laptop** implementation of the architecture
-we designed. Every component is open-source and local. The Claude API is
-swapped for **Ollama** running locally; everything else is production-identical.
+A GenAI-powered root cause analysis layer over **existing, already-populated
+production OpenSearch log indices** — read-only, no ingestion pipeline of its
+own. Ask a plain-English question about an order and get back a structured,
+evidence-grounded RCA. The same engine also runs proactively, watching for
+new errors and alerting via email/Slack before anyone has to ask.
 
----
-
-## What This POC Demonstrates
-
-1. **Spring Boot → Kafka → OpenSearch** pipeline (mocked with a Python log generator)
-2. **Parallel Python ingestor** consuming Kafka with its own consumer group
-3. **Full-text log search** (DQL/BM25 on OpenSearch — no embeddings, no vector index)
-4. **MCP server** with 3 tools (analyze_order_logs, get_order_status, find_similar_incidents)
-5. **LangGraph agent** that classifies intent and orchestrates tool calls
-6. **Local LLM** (Ollama with Qwen 2.5) for RCA synthesis
-7. **React chatbot UI** with a polished demo experience
-
-Realistic mock scenarios baked in: DB connection failures, NullPointerException,
-payment gateway timeouts, circuit breaker trips, inventory mismatches, fraud
-blocks, cascading 503s, race conditions, OOM, JSON parse errors.
+> For the full setup and day-2 operations, see:
+> - **[docs/STARTUP_V2.md](docs/STARTUP_V2.md)** — first-time setup
+> - **[docs/OPERATIONS_RUNBOOK_V2.md](docs/OPERATIONS_RUNBOOK_V2.md)** — restart scenarios, poller operations, troubleshooting
+> - **[docs/Architecture.docx](docs/Architecture.docx)** — architecture overview for stakeholders
 
 ---
 
-## System Requirements
+## The Five Modules
 
-| Resource | Minimum | Recommended |
-|---|---|---|
-| RAM | 8 GB | **16 GB** |
-| Disk | 20 GB | 50 GB |
-| GPU | None (CPU works) | Any, or Apple Silicon |
-| OS | macOS / Linux / Windows | macOS / Linux |
-
-If you're on an M1+ Mac with 16 GB RAM, you're golden.
+1. **Production Log Retrieval Layer** — reads directly from existing OpenSearch indices (one per client project). Two-step correlation: text-search the entity in question, then expand via `loggingId` to pull the full connected trace. No GenAI-owned ingestion pipeline.
+2. **RCA Synthesis Engine** — happy-path short-circuit (no LLM, zero hallucination risk) when no errors are found; grounded, structured RCA (LLM) when errors are present. Writes every completed RCA back to `incidents-historical`.
+3. **Proactive Error Detection & Alerting** — a background service polls every project's index every 10 minutes, deduped one alert per distinct `loggingId`, and pushes RCAs to email + Slack automatically.
+4. **Chat UI — Project Selection & Session Scoping** — greets the user, requires a project pick before chat is reachable, locks that choice for the session.
+5. **Persona-Aware Response Tuning** — a second selector (technical consultant vs. business user) changes the RCA's wording and technical depth without changing its structure.
 
 ---
 
-## Prerequisites
-
-Install once:
-
-```bash
-# Docker Desktop:        https://www.docker.com/products/docker-desktop
-# Python 3.11+:          https://www.python.org/downloads/
-# Node.js (for UI dev):  https://nodejs.org/   (optional — UI works without it)
-# Ollama:                https://ollama.com
-```
-
-After installing Ollama, pull the LLMs (one-time, ~6 GB download):
-
-```bash
-ollama pull qwen2.5:7b   # for RCA synthesis (4.7 GB)
-ollama pull qwen2.5:3b   # for intent routing (2 GB)
-```
-
----
-
-## Windows Users — IMPORTANT
-
-The `make` command doesn't exist on Windows by default. You have two equivalent options:
-
-### Option A: Use the PowerShell script (recommended)
-Every `make <target>` command in this README has an equivalent:
+## Quick Start
 
 ```powershell
-.\run.ps1 up                 # instead of: make up
-.\run.ps1 install            # instead of: make install
-.\run.ps1 smoke              # instead of: make smoke
-.\run.ps1 generate-logs      # instead of: make generate-logs
-# ... etc.
-```
-
-If you get **"running scripts is disabled on this system"**, run this once in an admin PowerShell:
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
-
-### Option B: Use the batch file wrapper
-From regular Command Prompt:
-```cmd
-run.bat up
-run.bat install
-run.bat smoke
-```
-
-### Option C: Install `make` on Windows
-If you really want `make`:
-```powershell
-# With Chocolatey:
-choco install make
-
-# With Scoop:
-scoop install make
-```
-
-Mac/Linux users can keep using `make` as documented below.
-
----
-
-## Quick Start (10 minutes)
-
-### Mac/Linux
-```bash
-make up                  # 1. Start infrastructure
-make install             # 2. Install Python deps
-make smoke               # 3. Verify everything is healthy
-make seed-incidents      # 4. Seed historical incidents
-make generate-logs       # 5. Generate 100 mock transactions
-```
-
-### Windows (PowerShell)
-```powershell
+# 1. Bring up local infra (OpenSearch, Postgres, Redis — no Kafka)
 .\run.ps1 up
+
+# 2. Install Python deps for all services
 .\run.ps1 install
-.\run.ps1 smoke
+
+# 3. Pull the local LLM models
+.\run.ps1 ollama-pull
+
+# 4. Seed historical incidents (one-time)
 .\run.ps1 seed-incidents
+
+# 5. (Optional) seed local test data if you don't have a real index to point at yet
 .\run.ps1 generate-logs
 ```
 
-Now open **3 separate terminals**:
-
-### Mac/Linux
-```bash
-# Terminal 1: Start the log ingestor
-make ingest
-
-# Terminal 2: Start the MCP server
-make mcp
-
-# Terminal 3: Start the orchestrator
-make orch
-```
-
-### Windows (PowerShell)
-```powershell
-# Terminal 1: Start the log ingestor
-.\run.ps1 ingest
-
-# Terminal 2: Start the MCP server
-.\run.ps1 mcp
-
-# Terminal 3: Start the orchestrator
-.\run.ps1 orch
-```
-
-Then in a 4th terminal:
-
-```bash
-# Mac/Linux
-make demo                  # one-shot curl test
-make ui                    # OR serve the React UI at http://localhost:3000/index.html
-```
+Then, each in its own terminal:
 
 ```powershell
-# Windows
+.\run.ps1 mcp        # MCP server, port 8001
+.\run.ps1 orch        # Orchestrator, port 8000
+.\run.ps1 monitor     # Proactive error monitor (Module 3)
+.\run.ps1 ui           # Chat UI, port 3000 (optional)
+```
+
+Verify:
+```powershell
+.\run.ps1 smoke
 .\run.ps1 demo
-.\run.ps1 ui
 ```
+
+Mac/Linux: the same commands exist as `make` targets (`make up`, `make install`, `make mcp`, etc.) — see the `Makefile`.
+
+Full details, including how to point at a real client OpenSearch index instead of local test data, are in **[docs/STARTUP_V2.md](docs/STARTUP_V2.md)**.
 
 ---
 
-## Verifying Each Layer Works
-
-### Check Kafka has messages
-Open Kafka UI: http://localhost:8080
-→ Navigate to Topics → `app-logs` → Messages
-
-### Check OpenSearch has indexed log chunks
-```bash
-curl 'http://localhost:9200/logs-vectors-current/_count'
-# Expect: {"count": ~50-200, ...}
-
-curl 'http://localhost:9200/logs-vectors-current/_search?size=1&pretty'
-# Should show a document with a composed_text / message field (plain text, no embedding vector)
-```
-
-Or use OpenSearch Dashboards: http://localhost:5601
-
-### Check Postgres has orders
-```bash
-docker exec -it poc-postgres psql -U postgres -d orders \
-  -c "SELECT order_no, status, failed_step FROM orders WHERE status='FAILED' LIMIT 5;"
-```
-
-### Test the MCP tools directly
-```bash
-# Get order status
-curl -X POST http://localhost:8001/tools/get_order_status \
-  -H "Content-Type: application/json" \
-  -d '{"order_no": "ORD-00005"}' | python -m json.tool
-
-# Analyze logs for an order
-curl -X POST http://localhost:8001/tools/analyze_order_logs \
-  -H "Content-Type: application/json" \
-  -d '{"order_no": "ORD-00005", "additional_context": "payment failure", "top_k": 5}' \
-  | python -m json.tool
-```
-
-### Test the end-to-end RCA
-```bash
-curl -X POST http://localhost:8000/api/v1/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Why did ORD-00005 fail?", "session_id": "demo"}' \
-  | python -m json.tool
-```
-
----
-
-## Demo Scenarios
-
-The mock log generator produces these realistic failure scenarios. Try asking
-the chatbot about each:
-
-| Question | Expected Behavior |
-|---|---|
-| "Why did ORD-00005 fail?" | Random failure scenario — payment, DB, NPE, etc. |
-| "What happened with ORD-00010?" | Different failure path |
-| "What is the status of ORD-00100?" | Status-only response (no log analysis) |
-| "Why was ORD-00015 blocked?" | Likely fraud check scenario |
-| "Hello, what can you do?" | General question response |
-| "Help me" | Clarification request |
-
-Order numbers from `ORD-00001` to `ORD-00200` are seeded with realistic data.
-
----
-
-## How RAG Works Here
-
-This is a Retrieval-Augmented Generation pipeline using **full-text search, not vector search**:
-
-1. **Retrieve** — three tools gather evidence before any generation:
-   - `get_order_status` — SQL JOIN on Postgres (orders/payments/shipments)
-   - `analyze_order_logs` — OpenSearch DQL, hard `term` filter on `order_no`, boosted by `has_error`
-   - `find_similar_incidents` — OpenSearch DQL `multi_match` (BM25) across past RCA summaries
-2. **Augment** — retrieved evidence is labeled (timestamps, services, error lines) and injected into the synthesis prompt.
-3. **Generate** — the LLM (`qwen2.5:7b` via Ollama) writes the RCA using *only* the injected evidence, and must say "insufficient evidence" rather than speculate.
-
-No embedding model or vector index is used — log error text (`HikariCP`, `NullPointerException`, etc.) has distinctive enough vocabulary that BM25 term matching outperforms semantic similarity here, and it avoids ~3 GB of extra dependencies. If a query's logs contain no errors, the flow skips the LLM entirely and returns a deterministic step summary instead — zero hallucination risk on the happy path.
-
-See `docs/PROJECT_DOCUMENTATION.md` for the full breakdown.
-
----
-
-## Architecture Recap
+## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│  Mock Log Generator      Postgres (orders, payments, etc.)     │
-│  (mimics Spring Boot)         ↑                                │
-│         │                     │                                │
-│         ▼                     │                                │
-│      Kafka                    │                                │
-│   (app-logs)                  │                                │
-│    │       │                  │                                │
-│    │       └──► Ingestor (Python) ──► OpenSearch (DQL/BM25)    │
-│    │                                  (logs-vectors-*)          │
-│    │                                       │                    │
-│    └──► (Logstash — skipped for POC)       │                   │
-│                                            │                    │
-│                          MCP Server (3 tools)                   │
-│                                  │                              │
-│                                  ▼                              │
-│                          LangGraph Agent                        │
-│                          + Ollama (local LLM)                   │
-│                                  │                              │
-│                                  ▼                              │
-│                          React Chatbot UI                       │
-└────────────────────────────────────────────────────────────────┘
+EXISTING CLIENT INFRASTRUCTURE (unchanged)
+  Spring Boot Apps ──(Fluentbit)──> Project OpenSearch Indices
+                                           │  READ-ONLY
+  ═══════════════════════════════════════▼══════════════════════
+  NEW GENAI RCA LAYER
+
+   MCP Server (6 tools) ◄──► incidents-historical (GenAI-owned index)
+          │
+   Orchestrator (LangGraph) ◄──► Proactive Monitor (Module 3)
+   + Ollama / Claude LLM         polls every 10 min, dedups by
+   Persona-aware synthesis       loggingId, alerts via email + Slack
+          │
+   Chat UI (React)
+   Project + Persona picker
 ```
+
+Every data-access path goes through the MCP server — the LLM never queries
+OpenSearch or Postgres directly, it only reasons over evidence the MCP tools
+retrieved. See `docs/Architecture.docx` for the full breakdown, key design
+decisions, and open items to verify against real production data.
 
 ---
 
@@ -275,141 +94,55 @@ See `docs/PROJECT_DOCUMENTATION.md` for the full breakdown.
 ```
 genai-rca-poc/
 ├── infra/
-│   └── docker-compose.yml          # All infrastructure
+│   └── docker-compose.yml          # Local dev infra: OpenSearch, Postgres, Redis
 ├── scripts/
-│   ├── init.sql                    # Postgres seed data
-│   ├── seed_incidents.py           # Historical RCAs into OpenSearch
-│   └── smoke_test.py               # Verify all services
+│   ├── init.sql                    # Postgres seed schema
+│   ├── seed_incidents.py           # Seeds incidents-historical (curated baseline)
+│   ├── smoke_test.py               # Verifies all live services
+│   └── _gen_architecture_docx.py   # Regenerates docs/Architecture.docx
 ├── services/
 │   ├── log-generator/
-│   │   ├── generate_logs.py        # Mock Spring Boot logs → Kafka
-│   │   └── requirements.txt
-│   ├── ingestor/
-│   │   ├── ingestor.py             # Kafka → OpenSearch (DQL full-text)
+│   │   ├── generate_logs.py            # Shared scenario library (no transport of its own)
+│   │   ├── generate_logs_opensearch.py # Seeds local test data directly into OpenSearch
 │   │   └── requirements.txt
 │   ├── mcp-server/
-│   │   ├── server.py               # 3 tools as HTTP endpoints
+│   │   ├── server.py               # 6 tools as HTTP endpoints
+│   │   ├── project_config.py       # Per-project index/search-field config
 │   │   └── requirements.txt
 │   ├── orchestrator/
-│   │   ├── main.py                 # FastAPI + LangGraph + Ollama
+│   │   ├── main.py                 # FastAPI + LangGraph + Ollama, chat + proactive entry points
+│   │   └── requirements.txt
+│   ├── monitor/
+│   │   ├── poller.py               # Module 3 — proactive error detection & alerting
 │   │   └── requirements.txt
 │   └── ui/
-│       └── index.html              # Single-file React chatbot
-├── Makefile                        # Convenience commands
+│       └── index.html              # Single-file React chatbot (project + persona picker)
+├── Makefile / run.ps1 / run.bat    # Convenience commands
 └── README.md                       # This file
 ```
 
 ---
 
-## Troubleshooting
+## How RAG Works Here
 
-### Windows: "running scripts is disabled on this system"
-PowerShell blocks scripts by default. Fix with (admin PowerShell, one-time):
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
-Then close and reopen PowerShell.
+Full-text search (DQL/BM25), not vector search:
 
-### Windows: "docker compose" not recognized
-Make sure Docker Desktop is installed AND running (check the system tray icon).
-If you have older Docker installed via Toolbox, use `docker-compose` (with hyphen) instead.
+1. **Retrieve** — `analyze_order_logs` text-searches the configured field (default `msg`) for the entity, expands via `loggingId` to the full trace; `find_similar_incidents` does BM25 `multi_match` against past RCAs.
+2. **Augment** — retrieved evidence is labeled (timestamps, services, error lines, partial-trace warnings) and injected into the synthesis prompt.
+3. **Generate** — the LLM writes the RCA using *only* the injected evidence. The FORMAT A (Root Cause Analysis) vs. FORMAT B (insufficient evidence) choice is decided deterministically in code from the evidence's confirmed error state, not left to the LLM to re-derive.
 
-### Windows: Python script seems to hang or use the wrong Python
-Windows has the `py` launcher which picks up Python 3 correctly. Verify with:
-```powershell
-py --version
-```
-If `py` isn't found, the script falls back to `python`. Make sure that points to Python 3.11+:
-```powershell
-python --version
-```
-
-### Windows: Path issues with backslashes
-The `run.ps1` script uses native PowerShell paths and handles this automatically. If you're running individual Python commands manually, use forward slashes in arguments to be safe.
-
-### Docker containers won't start
-```bash
-docker compose -f infra/docker-compose.yml logs
-# Common: not enough RAM. Stop other apps. Or reduce OpenSearch heap to 512m in docker-compose.yml
-```
-
-### `make smoke` shows Kafka unreachable
-Wait 30 seconds after `make up` — Kafka takes time to be ready.
-
-### Ollama "model not found"
-```bash
-ollama list  # check what you have
-ollama pull qwen2.5:7b
-```
-
-### Orchestrator times out on first query
-First LLM call loads the model into RAM (~5 GB). Subsequent calls are fast.
-Watch the Ollama logs: `journalctl -u ollama -f` or check Ollama's terminal output.
-
-### OpenSearch returns 0 results from analyze_order_logs
-1. Verify ingestor has run successfully and `_count` > 0 on the index
-2. Refresh the index: `curl -X POST http://localhost:9200/logs-vectors-current/_refresh`
-3. Confirm the `order_no` you're querying actually exists in the index (see the aggregation query in `docs/PROJECT_DOCUMENTATION.md`)
-
-### React UI shows "Error: failed to fetch"
-The orchestrator probably isn't running on port 8000. Check with `make smoke`.
-
-### Want to start completely fresh
-```bash
-make nuke              # delete all Docker volumes
-make up                # rebuild
-make install           # if you skipped this earlier
-make seed-incidents
-make generate-logs
-```
+No embedding model or vector index — log error text has distinctive enough vocabulary that BM25 term matching is more reliable here, and it avoids a significant dependency footprint.
 
 ---
 
-## Stretch Goals (Optional Enhancements)
+## Production Migration
 
-Once the basic POC works, try:
-
-1. **True MCP protocol** — convert `server.py` to use the official `mcp` Python SDK with stdio transport.
-2. **Streaming responses** — wire the orchestrator's `/api/v1/chat/stream` endpoint to the React UI for token-by-token display.
-3. **Langfuse** — add `langfuse:` to docker-compose and instrument every LangGraph node for observability.
-4. **Evaluation harness** — build a golden test set + Ragas evaluation script.
-5. **Production model swap** — change `ChatOllama` to `ChatAnthropic` in `orchestrator/main.py` to use real Claude Sonnet 4.5. One-line change.
-
----
-
-## Cost Tracker
-
-| Component | Cost |
+| Local dev | Production |
 |---|---|
-| Docker | $0 |
-| Kafka, OpenSearch, Postgres, Redis | $0 |
-| Ollama + Qwen 2.5 | $0 |
-| LangGraph, FastAPI, React | $0 |
-| **Total** | **$0** |
-
-The only thing you spend is your time and a bit of electricity.
-
----
-
-## Going from POC to Production
-
-When you're ready for the real client deployment:
-
-| Local POC | Production |
-|---|---|
-| Single-node OpenSearch | Multi-node cluster, 3 shards + 1 replica |
-| Mock log generator | Real Spring Boot logs via Kafka |
-| Skip Logstash | Existing Logstash flow continues |
-| Local Postgres | Order DB read-only replica |
-| Ollama + Qwen 2.5 | Claude Sonnet 4.5 (1-line code change) |
-| HTTP "MCP" endpoints | Official MCP protocol |
-| Single-file React | Vite + assistant-ui + auth |
+| Ollama (`qwen2.5:7b`/`qwen2.5:3b`) | Claude Sonnet / Haiku — 1-line `ChatOllama` → `ChatAnthropic` swap |
+| Local test data (`generate_logs_opensearch.py`) | Real client OpenSearch index — configure in `project_config.py` |
+| HTTP "MCP" endpoints | Official MCP stdio/SSE protocol |
+| Single-file React | Proper build (Vite), auth, SSE streaming |
 | No observability | LangSmith / Langfuse |
 
-The architecture is identical. Components are interchangeable.
-
-## To run in powershell
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
-
-## Stop service at 8080
-Stop-Service -Name "Jenkins"
+See `docs/Architecture.docx` for the full list, including open items that need verification against real production data before go-live.

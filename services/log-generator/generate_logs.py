@@ -1,23 +1,29 @@
 """
 =============================================================================
-Mock Log Generator — GenAI Log Analysis POC
+Mock Log Scenarios — shared library for local test-data generation
 =============================================================================
 
-Generates realistic structured JSON logs to Kafka topic 'app-logs' that mimic
-what real Spring Boot microservices would produce.
+Realistic, correlated log scenarios (happy path + 9 failure modes) mimicking
+what real Spring Boot microservices would produce. This module has no
+transport of its own — it's imported by generate_logs_opensearch.py, which
+writes these scenarios directly into OpenSearch in the real production field
+schema. There is no Kafka path anymore; the original Kafka-publishing
+generator was removed when the project moved off the Kafka+ingestor POC
+architecture (see docs/STARTUP_V2.md).
 
-Each log contains:
+Each generated log entry contains:
   - timestamp     (ISO 8601 UTC)
   - level         (INFO, WARN, ERROR)
   - service       (order-service, payment-service, inventory-service, etc.)
-  - trace_id      (groups logs for one transaction)
+  - trace_id      (groups logs for one transaction — becomes loggingId
+                    once mapped to the production schema)
   - order_no      (the key identifier — what users will ask about)
   - location_no   (warehouse location)
   - customer_email
   - message       (the log message)
   - exception     (full stack trace when applicable)
 
-Realistic failure scenarios baked in:
+Failure scenarios baked in:
   1. Database connection failures (timeout, pool exhausted, refused)
   2. NullPointerException in business logic
   3. Payment gateway timeouts
@@ -29,49 +35,23 @@ Realistic failure scenarios baked in:
   9. Stale cache returning wrong data
   10. Race conditions in concurrent updates
 
-Each scenario emits MULTIPLE correlated logs (5-15 per trace_id) so the
+Each scenario emits MULTIPLE correlated logs (2-7 per trace_id) so the
 GenAI agent can later piece together the full story.
-
-Usage:
-    # Continuous mode (default) — generates 5 logs/sec forever
-    python generate_logs.py
-
-    # Burst mode — generates N transactions and exits
-    python generate_logs.py --transactions 100 --burst
-
-    # Custom rate
-    python generate_logs.py --rate 10  # 10 logs/sec
 """
 
-import argparse
-import asyncio
-import json
 import random
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
-from aiokafka import AIOKafkaProducer
 
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-KAFKA_BOOTSTRAP = "localhost:9092"
-KAFKA_TOPIC = "app-logs"
-
 # Match Postgres seed data
 LOCATIONS = [
     "LOC-NYC-01", "LOC-LAX-01", "LOC-CHI-01", "LOC-LON-01", "LOC-FRA-01",
     "LOC-MUM-01", "LOC-BLR-01", "LOC-SGP-01", "LOC-SYD-01", "LOC-TOR-01",
-]
-
-SERVICES = [
-    "order-service",
-    "payment-service",
-    "inventory-service",
-    "shipping-service",
-    "notification-service",
-    "fraud-detection-service",
 ]
 
 # 200 orders pre-seeded in Postgres (ORD-00001 to ORD-00200)
@@ -532,92 +512,3 @@ def pick_scenario():
     """Weighted random pick of a scenario function."""
     funcs, weights = zip(*SCENARIOS)
     return random.choices(funcs, weights=weights, k=1)[0]
-
-
-# =============================================================================
-# MAIN PRODUCER LOOP
-# =============================================================================
-async def produce_transactions(producer: AIOKafkaProducer,
-                              num_transactions: int,
-                              rate_logs_per_sec: float):
-    """Generate transactions and send their logs to Kafka."""
-    total_logs = 0
-
-    for i in range(num_transactions):
-        # Pick a random order from the seeded range
-        order_id = random.randint(*ORDER_RANGE)
-        order_no = f"ORD-{order_id:05d}"
-        location_no = random.choice(LOCATIONS)
-        customer_email = f"customer{order_id}@example.com"
-
-        # Slightly back-dated timestamp (between now and 5 min ago)
-        t0 = datetime.now(timezone.utc) - timedelta(seconds=random.randint(0, 300))
-
-        # Generate the scenario logs
-        scenario_fn = pick_scenario()
-        logs = scenario_fn(order_no, location_no, customer_email, t0)
-
-        # Publish each log to Kafka
-        for log in logs:
-            payload = json.dumps(log).encode("utf-8")
-            # Partition by order_no so all logs for one order go to same partition
-            await producer.send(KAFKA_TOPIC, value=payload, key=order_no.encode())
-            total_logs += 1
-
-            # Throttle to target rate
-            if rate_logs_per_sec > 0:
-                await asyncio.sleep(1.0 / rate_logs_per_sec)
-
-        if i % 10 == 0:
-            scenario_name = scenario_fn.__name__.replace("scenario_", "")
-            print(f"[{i+1}/{num_transactions}] {order_no} @ {location_no} → {scenario_name} ({len(logs)} logs)")
-
-    print(f"\n✅ Done. Total logs published: {total_logs}")
-
-
-async def main():
-    parser = argparse.ArgumentParser(description="Mock log generator for GenAI POC")
-    parser.add_argument("--transactions", type=int, default=100,
-                       help="Number of transactions to generate (default: 100)")
-    parser.add_argument("--rate", type=float, default=5.0,
-                       help="Logs per second (default: 5)")
-    parser.add_argument("--burst", action="store_true",
-                       help="Burst mode: send as fast as possible, ignore rate")
-    parser.add_argument("--continuous", action="store_true",
-                       help="Run continuously (Ctrl+C to stop)")
-    parser.add_argument("--bootstrap", type=str, default=KAFKA_BOOTSTRAP,
-                       help="Kafka bootstrap servers")
-    args = parser.parse_args()
-
-    rate = 0 if args.burst else args.rate
-
-    producer = AIOKafkaProducer(
-        bootstrap_servers=args.bootstrap,
-        compression_type="gzip",
-    )
-    await producer.start()
-    print(f"📤 Connected to Kafka at {args.bootstrap}")
-    print(f"   Topic: {KAFKA_TOPIC}")
-    print(f"   Rate:  {'BURST' if args.burst else f'{args.rate} logs/sec'}\n")
-
-    try:
-        if args.continuous:
-            print("🔁 Continuous mode. Ctrl+C to stop.\n")
-            iteration = 0
-            while True:
-                iteration += 1
-                print(f"=== Batch {iteration} ===")
-                await produce_transactions(producer, args.transactions, rate)
-                await asyncio.sleep(2)
-        else:
-            await produce_transactions(producer, args.transactions, rate)
-    finally:
-        await producer.stop()
-        print("📴 Producer closed.")
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 Stopped by user.")

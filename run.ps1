@@ -1,18 +1,20 @@
 # =============================================================================
-# GenAI RCA POC -- PowerShell runner (Windows equivalent of Makefile)
+# GenAI RCA -- PowerShell runner (Windows equivalent of Makefile)
 # =============================================================================
+# The live architecture reads directly from an existing production OpenSearch
+# index -- there is no Kafka/ingestor step. See docs\STARTUP_V2.md.
 #
 # Usage:
 #     .\run.ps1 help              Show all commands
-#     .\run.ps1 up                Bring up infrastructure
+#     .\run.ps1 up                Bring up local infra (OpenSearch, Postgres, Redis)
 #     .\run.ps1 install           Install Python deps
 #     .\run.ps1 ollama-pull       Pull required Ollama models
 #     .\run.ps1 smoke             Verify all services
 #     .\run.ps1 seed-incidents    Seed historical incidents
-#     .\run.ps1 generate-logs     Generate mock logs to Kafka
-#     .\run.ps1 ingest            Run the Kafka -> vector ingestor
+#     .\run.ps1 generate-logs     Seed mock logs directly into OpenSearch (local testing only)
 #     .\run.ps1 mcp               Run the MCP server (port 8001)
 #     .\run.ps1 orch              Run the orchestrator (port 8000)
+#     .\run.ps1 monitor           Run the proactive error monitor (Module 3, no port)
 #     .\run.ps1 ui                Serve the React UI (port 3000)
 #     .\run.ps1 demo              Quick curl-style test
 #     .\run.ps1 down              Stop infrastructure
@@ -62,10 +64,10 @@ function Invoke-Python {
 
 function Cmd-Help {
     Write-Host ""
-    Write-Host "GenAI RCA POC -- PowerShell commands:" -ForegroundColor White
+    Write-Host "GenAI RCA -- PowerShell commands:" -ForegroundColor White
     Write-Host ""
     Write-Host "  Infrastructure:" -ForegroundColor Yellow
-    Write-Host "    .\run.ps1 up               Bring up Kafka, OpenSearch, Postgres, Redis"
+    Write-Host "    .\run.ps1 up               Bring up local infra: OpenSearch, Postgres, Redis"
     Write-Host "    .\run.ps1 down             Stop infrastructure (preserves data)"
     Write-Host "    .\run.ps1 nuke             Stop and DELETE all data"
     Write-Host "    .\run.ps1 smoke            Verify all services are healthy"
@@ -76,13 +78,13 @@ function Cmd-Help {
     Write-Host ""
     Write-Host "  Data:" -ForegroundColor Yellow
     Write-Host "    .\run.ps1 seed-incidents   Seed historical incidents to OpenSearch"
-    Write-Host "    .\run.ps1 generate-logs    Generate 100 mock transactions to Kafka"
-    Write-Host "    .\run.ps1 generate-burst   Generate 1000 mock transactions fast"
+    Write-Host "    .\run.ps1 generate-logs    Seed 100 mock transactions directly into OpenSearch (local testing only)"
+    Write-Host "    .\run.ps1 generate-burst   Seed 1000 mock transactions directly into OpenSearch (local testing only)"
     Write-Host ""
     Write-Host "  Run services (each in its own terminal):" -ForegroundColor Yellow
-    Write-Host "    .\run.ps1 ingest           Run the Kafka -> vector ingestor"
     Write-Host "    .\run.ps1 mcp              Run the MCP server (port 8001)"
     Write-Host "    .\run.ps1 orch             Run the orchestrator (port 8000)"
+    Write-Host "    .\run.ps1 monitor          Run the proactive error monitor (Module 3, no port)"
     Write-Host "    .\run.ps1 ui               Serve the React UI (port 3000)"
     Write-Host ""
     Write-Host "  Demo:" -ForegroundColor Yellow
@@ -140,12 +142,12 @@ function Cmd-Install {
     Write-Info "Installing Python dependencies for all services..."
     Write-Info "  - log-generator"
     Invoke-Python @("-m", "pip", "install", "-r", "$RepoRoot\services\log-generator\requirements.txt")
-    Write-Info "  - ingestor"
-    Invoke-Python @("-m", "pip", "install", "-r", "$RepoRoot\services\ingestor\requirements.txt")
     Write-Info "  - mcp-server"
     Invoke-Python @("-m", "pip", "install", "-r", "$RepoRoot\services\mcp-server\requirements.txt")
     Write-Info "  - orchestrator"
     Invoke-Python @("-m", "pip", "install", "-r", "$RepoRoot\services\orchestrator\requirements.txt")
+    Write-Info "  - monitor"
+    Invoke-Python @("-m", "pip", "install", "-r", "$RepoRoot\services\monitor\requirements.txt")
     Write-Success "Dependencies installed."
 }
 
@@ -167,20 +169,20 @@ function Cmd-SeedIncidents {
 }
 
 function Cmd-GenerateLogs {
-    Write-Info "Generating 100 mock transactions to Kafka..."
-    Invoke-Python @("$RepoRoot\services\log-generator\generate_logs.py", "--transactions", "100", "--rate", "5")
+    Write-Info "Seeding 100 mock transactions directly into OpenSearch..."
+    Push-Location "$RepoRoot\services\log-generator"
+    try {
+        Invoke-Python @("generate_logs_opensearch.py", "--transactions", "100")
+    } finally {
+        Pop-Location
+    }
 }
 
 function Cmd-GenerateBurst {
-    Write-Info "Generating 1000 mock transactions (burst)..."
-    Invoke-Python @("$RepoRoot\services\log-generator\generate_logs.py", "--transactions", "1000", "--burst")
-}
-
-function Cmd-Ingest {
-    Write-Info "Starting Kafka -> OpenSearch ingestor..."
-    Push-Location "$RepoRoot\services\ingestor"
+    Write-Info "Seeding 1000 mock transactions directly into OpenSearch..."
+    Push-Location "$RepoRoot\services\log-generator"
     try {
-        Invoke-Python @("ingestor.py")
+        Invoke-Python @("generate_logs_opensearch.py", "--transactions", "1000")
     } finally {
         Pop-Location
     }
@@ -206,6 +208,16 @@ function Cmd-Orch {
     }
 }
 
+function Cmd-Monitor {
+    Write-Info "Starting proactive error monitor (Module 3, polls every 10 min)..."
+    Push-Location "$RepoRoot\services\monitor"
+    try {
+        Invoke-Python @("poller.py")
+    } finally {
+        Pop-Location
+    }
+}
+
 function Cmd-Ui {
     Write-Info "Serving React UI on http://localhost:3000/index.html ..."
     Push-Location "$RepoRoot\services\ui"
@@ -222,6 +234,7 @@ function Cmd-Demo {
     $body = @{
         message    = "Why did ORD-00005 fail?"
         session_id = "demo"
+        project_id = "app_launchpad"
     } | ConvertTo-Json
     try {
         $response = Invoke-RestMethod -Uri "http://localhost:8000/api/v1/chat" `
@@ -249,9 +262,9 @@ switch ($Command.ToLower()) {
     "seed-incidents"   { Cmd-SeedIncidents }
     "generate-logs"    { Cmd-GenerateLogs }
     "generate-burst"   { Cmd-GenerateBurst }
-    "ingest"           { Cmd-Ingest }
     "mcp"              { Cmd-Mcp }
     "orch"             { Cmd-Orch }
+    "monitor"          { Cmd-Monitor }
     "ui"               { Cmd-Ui }
     "demo"             { Cmd-Demo }
     default {

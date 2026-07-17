@@ -1,1 +1,1 @@
-aiokafka==0.12.0
+opensearch-py==2.7.1
