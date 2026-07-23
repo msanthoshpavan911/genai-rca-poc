@@ -148,7 +148,7 @@ mono_block([
     "",
     "   ┌──────────────┐        ┌───────────────────────┐",
     "   │  MCP Server   │◄──────►│  incidents-historical  │  (GenAI-owned index)",
-    "   │  6 tools      │        └───────────────────────┘",
+    "   │  5 tools      │        └───────────────────────┘",
     "   └──────┬────────┘",
     "          │",
     "   ┌──────▼─────────────────────┐      ┌────────────────────────────┐",
@@ -164,7 +164,7 @@ mono_block([
 ])
 body(
     "Every data-access path — reads and the one write-back — goes through the MCP server. The LLM "
-    "never queries OpenSearch or Postgres directly; it only reasons over evidence the MCP tools "
+    "never queries OpenSearch directly; it only reasons over evidence the MCP tools "
     "retrieved. This keeps the system testable, auditable, and swappable.",
     italic=True, color=GREY,
 )
@@ -207,12 +207,11 @@ table_with_header(
     ["Layer", "Technology"],
     [
         ("Log storage / search", "OpenSearch — existing client indices, DQL / BM25 full-text (no vector embeddings)"),
-        ("Business data", "Postgres (optional, per-project — order/payment/shipment lookups)"),
         ("Session / monitor state", "Redis — poller checkpoints, alert dedup, minimal chat session ping"),
         ("Agent orchestration", "LangGraph state machine (FastAPI)"),
         ("LLM (local dev)", "Ollama — qwen2.5:7b (synthesis), qwen2.5:3b (routing)"),
         ("LLM (production target)", "Claude Sonnet (synthesis), Claude Haiku (routing) — one-line swap from ChatOllama to ChatAnthropic"),
-        ("Tool layer", "MCP-pattern HTTP tools (6), convertible to official MCP stdio/SSE protocol"),
+        ("Tool layer", "MCP-pattern HTTP tools (5), convertible to official MCP stdio/SSE protocol"),
         ("Notifications", "SMTP (email DL) + Slack incoming webhook"),
         ("UI", "Single-file React (chat, project + persona picker)"),
     ],
@@ -239,6 +238,19 @@ body(
     "correlation happens live: search for the entity as text, then expand via loggingId. This "
     "makes the system portable to any index with the same field shape, with zero pre-processing "
     "step to maintain."
+)
+
+h2("Time-window scoping to prevent token explosion")
+body(
+    "An order that fails repeatedly across days would produce many distinct loggingId traces, "
+    "all matching the anchor search. Without scoping, every historical failure trace for that "
+    "order would be concatenated into the LLM prompt — a token explosion. The fix is two-part: "
+    "(1) the router LLM extracts a date or time hint from the user's natural-language message "
+    "(\"on 7th July\", \"yesterday\", \"around 2pm\") and converts it to an ISO datetime range "
+    "that narrows the OpenSearch filter to that window; (2) MAX_TRACES is capped at 3, so even "
+    "within a single day at most 3 failure traces are returned. Without a date in the message, "
+    "the default look-back is 24 hours. Users do not need to type ISO dates — natural language "
+    "is resolved at query time."
 )
 
 h2("No vector embeddings")

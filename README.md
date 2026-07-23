@@ -26,7 +26,7 @@ new errors and alerting via email/Slack before anyone has to ask.
 ## Quick Start
 
 ```powershell
-# 1. Bring up local infra (OpenSearch, Postgres, Redis — no Kafka)
+# 1. Bring up local infra (OpenSearch, Redis — no Kafka, no Postgres)
 .\run.ps1 up
 
 # 2. Install Python deps for all services
@@ -83,9 +83,9 @@ EXISTING CLIENT INFRASTRUCTURE (unchanged)
 ```
 
 Every data-access path goes through the MCP server — the LLM never queries
-OpenSearch or Postgres directly, it only reasons over evidence the MCP tools
-retrieved. See `docs/Architecture.docx` for the full breakdown, key design
-decisions, and open items to verify against real production data.
+OpenSearch directly, it only reasons over evidence the MCP tools retrieved.
+See `docs/Architecture.docx` for the full breakdown, key design decisions,
+and open items to verify against real production data.
 
 ---
 
@@ -94,9 +94,8 @@ decisions, and open items to verify against real production data.
 ```
 genai-rca-poc/
 ├── infra/
-│   └── docker-compose.yml          # Local dev infra: OpenSearch, Postgres, Redis
+│   └── docker-compose.yml          # Local dev infra: OpenSearch, Redis
 ├── scripts/
-│   ├── init.sql                    # Postgres seed schema
 │   ├── seed_incidents.py           # Seeds incidents-historical (curated baseline)
 │   ├── smoke_test.py               # Verifies all live services
 │   └── _gen_architecture_docx.py   # Regenerates docs/Architecture.docx

@@ -13,13 +13,13 @@ Kafka and the `ingestor` service are legacy from the original POC and are
 | Service | Port | Required? | Purpose |
 |---|---|---|---|
 | OpenSearch (Docker) | 9200 | Yes | Log indices (per project) + `incidents-historical` |
-| Postgres (Docker) | 5432 | Optional | `get_order_status` tool — only if a project has a business-entity DB |
-| Redis (Docker) | 6379 | Yes | Poller checkpoints/dedup (Module 3); minimal session ping in orchestrator |
+| Redis (Docker) | 6379 | Yes | Poller checkpoints/dedup (Module 3); session ping in orchestrator |
 | Ollama (local) | 11434 | Yes | LLM serving — `qwen2.5:7b` (synthesis), `qwen2.5:3b` (routing) |
-| `services/mcp-server` | 8001 | Yes | 6 tools — retrieval, order status, incidents, save-back, proactive monitoring queries |
+| `services/mcp-server` | 8001 | Yes | 5 tools — log retrieval, incident search, save-back, proactive monitoring queries |
 | `services/orchestrator` | 8000 | Yes | Chat API, LangGraph agent, `/api/v1/internal/analyze_incident`, `/api/v1/projects` |
 | `services/monitor/poller.py` | — | Yes, for proactive alerting | Background loop — polls every 10 min, dedups by `loggingId`, sends email/Slack |
 | `services/ui/index.html` | 3000 | Optional (demo UI) | Project + persona picker, chat window |
+| Postgres | — | **No** (Phase 1 removed) | DB order-status lookup removed in Phase 1; will be reintroduced in a later phase |
 | Kafka / `services/ingestor` | — | **No** (legacy) | Only relevant if you still want the old Kafka-based mock-log demo path |
 
 ---
@@ -44,7 +44,7 @@ cd C:\Mamidi\2026\genai-rca-poc\genai-rca-poc
 .\run.ps1 up
 ```
 
-This still brings up Kafka/Kafka UI too (docker-compose wasn't trimmed) — you can ignore those; nothing in the current flow depends on them. What matters: **OpenSearch, Postgres, Redis** report healthy.
+This still brings up Kafka/Kafka UI too — you can ignore those; nothing in the current flow depends on them. What matters: **OpenSearch** and **Redis** report healthy. Postgres has been removed from the compose file (Phase 1).
 
 ```powershell
 docker ps
@@ -165,9 +165,19 @@ Invoke-RestMethod http://localhost:8001/tools
 Invoke-RestMethod http://localhost:8000/healthz
 Invoke-RestMethod http://localhost:8000/api/v1/projects
 
-# End-to-end chat query
+# End-to-end chat query (default — searches last 24 hours)
 $body = @{
   message = "Why did ORD-00005 fail?"
+  session_id = "test"
+  project_id = "app_launchpad"
+  persona = "technical"
+} | ConvertTo-Json
+Invoke-RestMethod -Uri http://localhost:8000/api/v1/chat -Method Post -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 5
+
+# Time-scoped query — include a date for orders that fail repeatedly across days
+# The orchestrator extracts the date from natural language automatically
+$body = @{
+  message = "Why did ORD-00005 fail on 7th July?"
   session_id = "test"
   project_id = "app_launchpad"
   persona = "technical"
@@ -178,6 +188,12 @@ Invoke-RestMethod -Uri http://localhost:8000/api/v1/chat -Method Post -ContentTy
 Expect a JSON response with `evidence_count > 0` and, for a failing order,
 `is_rca: true`. First query takes 30–60s while Ollama loads the model;
 subsequent queries are 5–15s.
+
+**Time-window scoping**: if an order fails repeatedly across multiple days,
+include a date in the message ("on 7th July", "yesterday", "last Monday").
+The orchestrator extracts it and narrows the OpenSearch search to that day,
+preventing token explosion from pulling every historical failure trace at once.
+Without a date, the default look-back is 24 hours.
 
 ---
 

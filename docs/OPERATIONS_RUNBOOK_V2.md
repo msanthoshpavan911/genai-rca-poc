@@ -40,8 +40,9 @@ System tray whale icon: steady = up, animated = starting, absent = not running.
 docker ps
 ```
 
-You need **OpenSearch, Postgres, Redis** healthy. Kafka/Kafka UI showing up
-too is harmless — nothing in the current flow uses them.
+You need **OpenSearch, Redis** healthy. Kafka/Kafka UI showing up too is
+harmless — nothing in the current flow uses them. Postgres has been removed
+(Phase 1 production elevation).
 
 ### Check 3: Is Ollama running?
 
@@ -63,7 +64,7 @@ check its terminal/log output directly (it logs every poll cycle).
 ### Decision Tree
 
 ```
-docker ps shows OpenSearch/Postgres/Redis healthy?
+docker ps shows OpenSearch/Redis healthy?
 ├── YES → Are MCP server + orchestrator responding to /healthz?
 │         ├── YES → Everything's up. Check the poller terminal separately.
 │         └── NO  → Scenario B
@@ -88,7 +89,7 @@ cd C:\Mamidi\2026\genai-rca-poc\genai-rca-poc
 .\run.ps1 up
 docker ps
 ```
-Confirm OpenSearch, Postgres, Redis are `Up (healthy)`.
+Confirm OpenSearch and Redis are `Up (healthy)`.
 
 ### A4 — Verify data survived
 ```powershell
@@ -172,7 +173,7 @@ Python service terminals.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| MCP `/healthz` fails | Process died, or OpenSearch/Postgres unreachable | Check `docker ps`; restart the MCP terminal (A5, Window 1) |
+| MCP `/healthz` fails | Process died, or OpenSearch unreachable | Check `docker ps`; restart the MCP terminal (A5, Window 1) |
 | Orchestrator `/healthz` fails | Process died, or MCP unreachable | Restart orchestrator terminal (A5, Window 2) |
 | Poller logs "find_new_errors failed" repeatedly | MCP server down, or index name misconfigured | Check MCP is up; check `project_config.py` index name against `docker`'s OpenSearch |
 | Chat returns `evidence_count: 0` for a known-bad order | Wrong `project_id`, or the order text doesn't appear in the configured `search_field` | Confirm `search_field` (default `msg`) actually contains the order number as text — see Troubleshooting below |
@@ -181,7 +182,7 @@ Python service terminals.
 To restart a single Docker container:
 ```powershell
 cd C:\Mamidi\2026\genai-rca-poc\genai-rca-poc\infra
-docker compose restart opensearch    # or postgres, redis
+docker compose restart opensearch    # or redis
 ```
 
 To restart a Python service: Ctrl+C in its terminal, then re-run the start
@@ -334,7 +335,6 @@ docker ps
 .\run.ps1 nuke
 docker compose restart opensearch
 docker logs poc-opensearch --tail 50
-docker exec -it poc-postgres psql -U postgres -d orders
 docker exec -it poc-redis redis-cli
 ```
 
@@ -379,8 +379,12 @@ Invoke-RestMethod -Uri "http://localhost:9200/<index-name>/_search" -Method Post
 
 ### MCP Tool Direct Calls (bypass the LLM)
 ```powershell
-# analyze_order_logs
-$body = @{ project_id="app_launchpad"; order_no="ORD-00005"; top_k=5 } | ConvertTo-Json
+# analyze_order_logs — default (last 24 hours)
+$body = @{ project_id="app_launchpad"; order_no="ORD-00005"; top_k=3 } | ConvertTo-Json
+Invoke-RestMethod -Uri http://localhost:8001/tools/analyze_order_logs -Method Post -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 4
+
+# analyze_order_logs — scoped to a specific day (avoids token explosion for frequently-failing orders)
+$body = @{ project_id="app_launchpad"; order_no="ORD-00005"; top_k=3; time_window_start="2026-07-07T00:00:00Z"; time_window_end="2026-07-07T23:59:59Z" } | ConvertTo-Json
 Invoke-RestMethod -Uri http://localhost:8001/tools/analyze_order_logs -Method Post -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 4
 
 # get_trace_by_logging_id
@@ -391,7 +395,7 @@ Invoke-RestMethod -Uri http://localhost:8001/tools/get_trace_by_logging_id -Meth
 $body = @{ project_id="app_launchpad"; since=(Get-Date).AddHours(-1).ToString("o") } | ConvertTo-Json
 Invoke-RestMethod -Uri http://localhost:8001/tools/find_new_errors -Method Post -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 4
 
-# List all 6 tools
+# List all 5 tools
 Invoke-RestMethod http://localhost:8001/tools
 ```
 
@@ -405,8 +409,13 @@ Invoke-RestMethod http://localhost:8001/tools
 2. Confirm the order number appears as literal text in the configured
    `search_field` (default `msg`) — if the real field is `log_message`
    instead, set `PROJECT_<ID>_SEARCH_FIELD` accordingly
-3. Confirm `time_window_hours` (default 24) actually covers when the logs
-   were written
+3. Confirm the time window covers when the logs were written. By default the
+   system looks back 24 hours. For older failures, include a date in the chat
+   message: `"Why did ORD-00143 fail on 7th July?"` — the orchestrator
+   extracts the date and narrows the OpenSearch range filter automatically
+4. When calling `analyze_order_logs` directly (bypassing the chatbot), pass
+   `time_window_start` / `time_window_end` as ISO datetimes if the logs fall
+   outside the default 24-hour window
 
 ### `find_new_errors` / poller never finds anything
 
@@ -447,7 +456,6 @@ watching the logs.
 | What | Persists across restart? | Lost on `nuke`? |
 |---|---|---|
 | OpenSearch indices (logs, incidents) | Yes | Yes |
-| Postgres tables | Yes | Yes |
 | Redis (poller checkpoints, alerted-loggingId set) | Yes | Yes |
 | Ollama models | Yes (on disk) | No |
 | Environment variables (User scope) | Yes | No |

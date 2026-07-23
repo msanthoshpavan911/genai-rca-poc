@@ -39,7 +39,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 
-import asyncpg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from opensearchpy import AsyncOpenSearch
@@ -62,11 +61,7 @@ LOGGING_ID_FIELD  = os.getenv("LOGGING_ID_FIELD", "loggingId.keyword")
 
 # Cap on how many distinct loggingId traces one order/entity search expands
 # into, so one query can't pull an unbounded number of transactions.
-MAX_TRACES        = int(os.getenv("MAX_TRACES", "5"))
-
-POSTGRES_DSN      = os.getenv(
-    "POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/orders"
-)
+MAX_TRACES        = int(os.getenv("MAX_TRACES", "3"))
 
 
 # =============================================================================
@@ -76,8 +71,10 @@ class AnalyzeLogsRequest(BaseModel):
     project_id: str = Field(..., description="Which project's index to search, e.g. 'app_launchpad'")
     order_no: str = Field(..., description="The order/entity number, e.g. ORD-00042")
     additional_context: str = Field("", description="Extra hint, e.g. 'payment timeout'")
-    time_window_hours: int = Field(24, description="Look back N hours")
-    top_k: int = Field(20, description="Max log chunks (traces) to return")
+    time_window_hours: int = Field(24, description="Default look-back when no explicit window given")
+    top_k: int = Field(3, description="Max log chunks (traces) to return")
+    time_window_start: Optional[str] = Field(None, description="ISO datetime lower bound (overrides time_window_hours)")
+    time_window_end:   Optional[str] = Field(None, description="ISO datetime upper bound (open-ended if omitted)")
 
 
 class LogChunk(BaseModel):
@@ -129,29 +126,6 @@ class NewErrorsResponse(BaseModel):
     incidents: List[NewErrorIncident]
 
 
-class OrderStatusRequest(BaseModel):
-    order_no: str
-
-
-class OrderStatusResponse(BaseModel):
-    found: bool
-    order_no: Optional[str] = None
-    location_no: Optional[str] = None
-    location_name: Optional[str] = None
-    region: Optional[str] = None
-    status: Optional[str] = None
-    failed_step: Optional[str] = None
-    amount: Optional[float] = None
-    currency: Optional[str] = None
-    created_at: Optional[str] = None
-    payment_status: Optional[str] = None
-    payment_method: Optional[str] = None
-    payment_failure_reason: Optional[str] = None
-    shipment_status: Optional[str] = None
-    tracking_id: Optional[str] = None
-    carrier: Optional[str] = None
-
-
 class SimilarIncidentsRequest(BaseModel):
     description: str = Field(..., description="Free-text description of the issue")
     top_k: int = Field(3, description="Number of similar incidents to return")
@@ -188,7 +162,7 @@ class SaveIncidentResponse(BaseModel):
 
 
 # =============================================================================
-# LIFESPAN: shared OS client and DB pool
+# LIFESPAN: shared OS client
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -196,10 +170,8 @@ async def lifespan(app: FastAPI):
         hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
         use_ssl=False, verify_certs=False,
     )
-    app.state.pool = await asyncpg.create_pool(POSTGRES_DSN, min_size=2, max_size=10)
     yield
     await app.state.os.close()
-    await app.state.pool.close()
 
 
 app = FastAPI(title="MCP Server (POC)", lifespan=lifespan)
@@ -230,15 +202,19 @@ def _compose_line(doc: dict, search_field: str) -> str:
     return line
 
 
-async def _fetch_trace(index: str, logging_id: str, since: str) -> Optional[List[dict]]:
+async def _fetch_trace(index: str, logging_id: str, since: str,
+                       until: Optional[str] = None) -> Optional[List[dict]]:
     """Pull every raw log document correlated by loggingId, sorted by time."""
+    ts_range = {"gte": since}
+    if until:
+        ts_range["lte"] = until
     body = {
         "size": 200,
         "query": {
             "bool": {
                 "filter": [
                     {"term": {LOGGING_ID_FIELD: logging_id}},
-                    {"range": {"@timestamp": {"gte": since}}},
+                    {"range": {"@timestamp": ts_range}},
                 ]
             }
         },
@@ -292,7 +268,17 @@ async def analyze_order_logs(req: AnalyzeLogsRequest):
 
     index = project["index"]
     search_field = project["search_field"]
-    since = (datetime.now(timezone.utc) - timedelta(hours=req.time_window_hours)).isoformat()
+
+    if req.time_window_start:
+        since = req.time_window_start
+        until = req.time_window_end or None
+    else:
+        since = (datetime.now(timezone.utc) - timedelta(hours=req.time_window_hours)).isoformat()
+        until = None
+
+    ts_range = {"gte": since}
+    if until:
+        ts_range["lte"] = until
 
     should_clauses = [{"match": {"level": {"query": "ERROR", "boost": 1.5}}}]
     if req.additional_context:
@@ -304,8 +290,8 @@ async def analyze_order_logs(req: AnalyzeLogsRequest):
         "size": 20,
         "query": {
             "bool": {
-                "must": [{"match": {search_field: req.order_no}}],
-                "filter": [{"range": {"@timestamp": {"gte": since}}}],
+                "must": [{"match_phrase": {search_field: req.order_no}}],
+                "filter": [{"range": {"@timestamp": ts_range}}],
                 "should": should_clauses,
             }
         },
@@ -342,7 +328,7 @@ async def analyze_order_logs(req: AnalyzeLogsRequest):
 
     for lid in logging_ids:
         try:
-            docs = await _fetch_trace(index, lid, since)
+            docs = await _fetch_trace(index, lid, since, until)
         except Exception as e:
             raise HTTPException(500, f"OpenSearch error: {e}")
         if not docs:
@@ -446,42 +432,7 @@ async def find_new_errors(req: NewErrorsRequest):
 
 
 # =============================================================================
-# TOOL 2: get_order_status
-# =============================================================================
-@app.post("/tools/get_order_status", response_model=OrderStatusResponse)
-async def get_order_status(req: OrderStatusRequest):
-    """
-    Authoritative current state from Postgres.
-    Parameterized SQL -- never string concatenation.
-    """
-    query = """
-        SELECT
-            o.order_no, o.location_no, o.status, o.failed_step,
-            o.amount::float as amount, o.currency, o.created_at::text,
-            l.location_name, l.region,
-            p.status         as payment_status,
-            p.method         as payment_method,
-            p.failure_reason as payment_failure_reason,
-            s.status         as shipment_status,
-            s.tracking_id, s.carrier
-        FROM orders o
-        LEFT JOIN locations l ON l.location_no = o.location_no
-        LEFT JOIN payments  p ON p.order_no    = o.order_no
-        LEFT JOIN shipments s ON s.order_no    = o.order_no
-        WHERE o.order_no = $1
-        LIMIT 1
-    """
-    async with app.state.pool.acquire() as conn:
-        row = await conn.fetchrow(query, req.order_no)
-
-    if not row:
-        return OrderStatusResponse(found=False)
-
-    return OrderStatusResponse(found=True, **dict(row))
-
-
-# =============================================================================
-# TOOL 3: find_similar_incidents
+# TOOL 2: find_similar_incidents
 # =============================================================================
 @app.post("/tools/find_similar_incidents", response_model=SimilarIncidentsResponse)
 async def find_similar_incidents(req: SimilarIncidentsRequest):
@@ -580,12 +531,6 @@ async def list_tools():
                 "path": "/tools/analyze_order_logs",
                 "description": "Retrieve relevant log evidence for an order via loggingId-correlated search against a project's production index.",
                 "input_schema": AnalyzeLogsRequest.model_json_schema(),
-            },
-            {
-                "name": "get_order_status",
-                "path": "/tools/get_order_status",
-                "description": "Fetch authoritative order/payment/shipment status from DB.",
-                "input_schema": OrderStatusRequest.model_json_schema(),
             },
             {
                 "name": "find_similar_incidents",

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Dict, List, Literal, Optional, TypedDict
 
 import httpx
@@ -87,23 +88,36 @@ Keywords:"""
 
 
 INTENT_CLASSIFIER_PROMPT = """You classify user questions into one of these intents:
-- ORDER_INQUIRY:    asking about a specific order's status, failure, history (mentions order number like ORD-00042)
-- STATUS_ONLY:      asking only "what's the status" with no need for log analysis
+- ORDER_INQUIRY:    asking about a specific order's failure, history, or logs (mentions order number like ORD-00042)
 - GENERAL_QUESTION: general questions not about a specific order
 - CLARIFICATION:    too vague to act on, need to ask the user a follow-up
 
-Respond with ONLY one word: ORDER_INQUIRY, STATUS_ONLY, GENERAL_QUESTION, or CLARIFICATION.
+Respond with ONLY one word: ORDER_INQUIRY, GENERAL_QUESTION, or CLARIFICATION.
 
 User question: {message}
 Classification:"""
+
+TIME_WINDOW_EXTRACTION_PROMPT = """Extract a time window from the user message below.
+
+Current UTC datetime: {now}
+
+Rules:
+- Specific date ("7th July", "July 7", "07/07/2026") → full calendar day in UTC (00:00:00 to 23:59:59).
+- "yesterday" → the previous calendar day.
+- "last Monday", "last week", etc. → compute from the current date above.
+- Time hint ("around 2pm", "at 14:00") → 2-hour window centred on that time on the mentioned date.
+- No date or time mentioned → return null for both fields.
+
+Respond with ONLY valid JSON, no explanation, no markdown:
+{{"start": "<ISO datetime or null>", "end": "<ISO datetime or null>"}}
+
+User message: {message}
+JSON:"""
 
 
 RCA_SYNTHESIS_PROMPT = """You are a senior Site Reliability Engineer reviewing order activity.
 
 {persona_instructions}
-
-ORDER STATUS (from database):
-{order_status}
 
 LOG EVIDENCE:
 {log_evidence}
@@ -186,7 +200,8 @@ class AgentState(TypedDict):
     persona: str
     order_no: Optional[str]
     intent: Optional[str]
-    order_status: Optional[Dict]
+    time_window_start: Optional[str]   # ISO datetime extracted from user message
+    time_window_end:   Optional[str]   # ISO datetime; None = open-ended (use default look-back)
     log_evidence: Optional[Dict]
     similar_incidents: Optional[List[Dict]]
     response: Optional[str]
@@ -208,6 +223,29 @@ def extract_order_no(text: str) -> Optional[str]:
         prefix, num = order_no.split("-")
         return f"{prefix}-{int(num):05d}"
     return None
+
+
+async def extract_time_window(message: str) -> tuple[Optional[str], Optional[str]]:
+    """Ask the router LLM to extract a time window from the user's message.
+    Returns (start_iso, end_iso) or (None, None) if no date is mentioned."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    llm = get_router_llm()
+    try:
+        result = await llm.ainvoke([
+            HumanMessage(content=TIME_WINDOW_EXTRACTION_PROMPT.format(now=now, message=message))
+        ])
+        raw = result.content.strip()
+        # The model sometimes wraps JSON in markdown fences — strip them
+        raw = re.sub(r"^```[a-z]*\n?|```$", "", raw, flags=re.MULTILINE).strip()
+        parsed = json.loads(raw)
+        start = parsed.get("start") or None
+        end   = parsed.get("end")   or None
+        if start:
+            log.info(f"Time window extracted: {start} → {end or 'open'}")
+        return start, end
+    except Exception as e:
+        log.warning(f"Time window extraction failed ({e}), using default look-back")
+        return None, None
 
 
 async def call_mcp(tool_path: str, payload: dict) -> dict:
@@ -250,34 +288,19 @@ async def classify_intent(state: AgentState) -> AgentState:
     state["order_no"] = order_no
 
     if order_no:
-        # Heuristic: if "status" is the only thing they want, route accordingly
-        lower = message.lower()
-        if any(w in lower for w in ["just status", "only status", "what is the status", "current status"]):
-            state["intent"] = "STATUS_ONLY"
-        else:
-            state["intent"] = "ORDER_INQUIRY"
+        state["intent"] = "ORDER_INQUIRY"
+        start, end = await extract_time_window(message)
+        state["time_window_start"] = start
+        state["time_window_end"]   = end
         return state
 
     # No order number — ask the LLM
     llm = get_router_llm()
     result = await llm.ainvoke([HumanMessage(content=INTENT_CLASSIFIER_PROMPT.format(message=message))])
     classification = result.content.strip().upper().split()[0].rstrip(".,")
-    if classification not in {"ORDER_INQUIRY", "STATUS_ONLY", "GENERAL_QUESTION", "CLARIFICATION"}:
+    if classification not in {"ORDER_INQUIRY", "GENERAL_QUESTION", "CLARIFICATION"}:
         classification = "CLARIFICATION"
     state["intent"] = classification
-    return state
-
-
-async def fetch_order_status(state: AgentState) -> AgentState:
-    log.info("Node: fetch_order_status")
-    if not state.get("order_no"):
-        return state
-    try:
-        result = await call_mcp("/tools/get_order_status", {"order_no": state["order_no"]})
-        state["order_status"] = result
-    except Exception as e:
-        log.error(f"get_order_status failed: {e}")
-        state["order_status"] = {"found": False, "error": str(e)}
     return state
 
 
@@ -286,12 +309,17 @@ async def analyze_logs(state: AgentState) -> AgentState:
     if not state.get("order_no"):
         return state
     try:
-        result = await call_mcp("/tools/analyze_order_logs", {
+        payload = {
             "project_id": state["project_id"],
-            "order_no": state["order_no"],
+            "order_no":   state["order_no"],
             "additional_context": state["user_message"],
-            "top_k": 20,
-        })
+            "top_k": 3,
+        }
+        if state.get("time_window_start"):
+            payload["time_window_start"] = state["time_window_start"]
+        if state.get("time_window_end"):
+            payload["time_window_end"] = state["time_window_end"]
+        result = await call_mcp("/tools/analyze_order_logs", payload)
         state["log_evidence"] = result
     except Exception as e:
         log.error(f"analyze_order_logs failed: {e}")
@@ -415,7 +443,6 @@ async def synthesize_rca(state: AgentState) -> AgentState:
     log.info("Node: synthesize_rca")
 
     chunks = state.get("log_evidence", {}).get("log_chunks", [])
-    status_str   = json.dumps(state.get("order_status", {"found": False}), indent=2)
     evidence_str = _format_evidence(chunks)
 
     incidents     = state.get("similar_incidents", [])
@@ -430,7 +457,6 @@ async def synthesize_rca(state: AgentState) -> AgentState:
     prompt = RCA_SYNTHESIS_PROMPT.format(
         persona_instructions=persona_instructions,
         format_directive=_format_directive(chunks),
-        order_status=status_str,
         log_evidence=evidence_str,
         similar_incidents=incidents_str,
     )
@@ -491,34 +517,6 @@ async def save_incident(state: AgentState) -> AgentState:
     return state
 
 
-async def status_only_response(state: AgentState) -> AgentState:
-    """Just format the structured status into plain English."""
-    log.info("Node: status_only_response")
-    if not state.get("order_no"):
-        state["response"] = "Please tell me the order number (e.g., ORD-00042)."
-        return state
-
-    status = state.get("order_status") or {}
-    if not status.get("found"):
-        state["response"] = f"I couldn't find order {state['order_no']}."
-        return state
-
-    location = status.get("location_name", "unknown location")
-    region = status.get("region", "")
-    state["response"] = (
-        f"**Order {status['order_no']}**\n\n"
-        f"- Location: {location} ({region})\n"
-        f"- Status: **{status.get('status')}**"
-        + (f" — failed at step: {status.get('failed_step')}" if status.get('failed_step') else "")
-        + f"\n- Amount: {status.get('amount')} {status.get('currency')}\n"
-        f"- Payment: {status.get('payment_status', 'n/a')} via {status.get('payment_method', 'n/a')}"
-        + (f"\n  Failure reason: {status['payment_failure_reason']}" if status.get('payment_failure_reason') else "")
-        + (f"\n- Shipment: {status.get('shipment_status')} via {status.get('carrier')} (tracking: {status.get('tracking_id')})"
-           if status.get('shipment_status') else "")
-    )
-    return state
-
-
 async def happy_path_summary(state: AgentState) -> AgentState:
     """Format executed steps for orders whose logs contain no errors.
     Purely programmatic — no LLM involved, zero hallucination risk.
@@ -529,31 +527,10 @@ async def happy_path_summary(state: AgentState) -> AgentState:
     log.info("Node: happy_path_summary")
 
     order_no = state.get("order_no", "unknown")
-    status   = state.get("order_status") or {}
     chunks   = state.get("log_evidence", {}).get("log_chunks", [])
     persona  = state.get("persona") or DEFAULT_PERSONA
 
     lines = [f"**Order {order_no} — Executed Steps**\n"]
-
-    # ── Current status from DB ──────────────────────────────────────────────
-    if status.get("found"):
-        lines.append(
-            f"**Current Status**: {status.get('status')} | "
-            f"Amount: {status.get('amount')} {status.get('currency')} | "
-            f"Location: {status.get('location_name')} ({status.get('region')})"
-        )
-        if status.get("payment_status"):
-            line = f"**Payment**: {status['payment_status']} via {status.get('payment_method', 'N/A')}"
-            if status.get("payment_failure_reason"):
-                line += f" — {status['payment_failure_reason']}"
-            lines.append(line)
-        if status.get("shipment_status"):
-            lines.append(
-                f"**Shipment**: {status['shipment_status']} via "
-                f"{status.get('carrier', 'N/A')} "
-                f"(tracking: {status.get('tracking_id', 'N/A')})"
-            )
-        lines.append("")
 
     # ── Log timeline ────────────────────────────────────────────────────────
     if not chunks:
@@ -583,6 +560,19 @@ async def happy_path_summary(state: AgentState) -> AgentState:
     return state
 
 
+async def no_evidence_response(state: AgentState) -> AgentState:
+    order_no = state.get("order_no", "the requested order")
+    state["response"] = (
+        f"No log evidence was found for **{order_no}** in the current index. "
+        "This usually means the order does not exist in the logs, "
+        "falls outside the search window, or has not been processed yet. "
+        "Please verify the order number and try again."
+    )
+    state["is_rca"] = False
+    state["evidence_count"] = 0
+    return state
+
+
 async def clarify_response(state: AgentState) -> AgentState:
     state["response"] = (
         "I'd be happy to help — could you tell me the order number? "
@@ -602,20 +592,20 @@ async def general_response(state: AgentState) -> AgentState:
 # =============================================================================
 # ROUTING
 # =============================================================================
-def route_after_logs(state: AgentState) -> Literal["rca", "happy_path"]:
+def route_after_logs(state: AgentState) -> Literal["rca", "happy_path", "no_evidence"]:
     evidence = state.get("log_evidence") or {}
     chunks   = evidence.get("log_chunks", [])
-    if chunks and not evidence.get("has_errors", False):
+    if not chunks:
+        return "no_evidence"
+    if not evidence.get("has_errors", False):
         return "happy_path"
     return "rca"
 
 
-def route_after_classify(state: AgentState) -> Literal["evidence", "status_only", "general", "clarify"]:
+def route_after_classify(state: AgentState) -> Literal["evidence", "general", "clarify"]:
     intent = state.get("intent")
     if intent == "ORDER_INQUIRY":
         return "evidence"
-    if intent == "STATUS_ONLY":
-        return "status_only"
     if intent == "GENERAL_QUESTION":
         return "general"
     return "clarify"
@@ -628,42 +618,38 @@ def build_graph():
     graph = StateGraph(AgentState)
 
     graph.add_node("classify", classify_intent)
-    graph.add_node("fetch_status_inquiry", fetch_order_status)
     graph.add_node("analyze_logs", analyze_logs)
     graph.add_node("happy_path_summary", happy_path_summary)
+    graph.add_node("no_evidence", no_evidence_response)
     graph.add_node("find_similar", find_similar)
     graph.add_node("synthesize", synthesize_rca)
     graph.add_node("save_incident", save_incident)
-    graph.add_node("fetch_status_only", fetch_order_status)
-    graph.add_node("status_response", status_only_response)
     graph.add_node("clarify", clarify_response)
     graph.add_node("general", general_response)
 
     graph.set_entry_point("classify")
 
     graph.add_conditional_edges("classify", route_after_classify, {
-        "evidence":     "fetch_status_inquiry",
-        "status_only":  "fetch_status_only",
-        "general":      "general",
-        "clarify":      "clarify",
+        "evidence": "analyze_logs",
+        "general":  "general",
+        "clarify":  "clarify",
     })
 
-    graph.add_edge("fetch_status_inquiry", "analyze_logs")
-
-    # After log retrieval: happy-path logs → clean step summary (no LLM)
-    #                      error logs / no logs → RCA pipeline
+    # After log retrieval: no logs found → no_evidence message (no LLM, no hallucination)
+    #                      logs with no errors → clean step summary (no LLM)
+    #                      logs with errors → full RCA pipeline
     graph.add_conditional_edges("analyze_logs", route_after_logs, {
-        "happy_path": "happy_path_summary",
-        "rca":        "find_similar",
+        "no_evidence": "no_evidence",
+        "happy_path":  "happy_path_summary",
+        "rca":         "find_similar",
     })
+    graph.add_edge("no_evidence", END)
     graph.add_edge("happy_path_summary", END)
 
     graph.add_edge("find_similar", "synthesize")
     graph.add_edge("synthesize", "save_incident")
     graph.add_edge("save_incident", END)
 
-    graph.add_edge("fetch_status_only", "status_response")
-    graph.add_edge("status_response", END)
     graph.add_edge("clarify", END)
     graph.add_edge("general", END)
 
@@ -729,7 +715,8 @@ async def chat(req: ChatRequest):
         "project_id": req.project_id,
         "persona": req.persona,
         "order_no": None, "intent": None,
-        "order_status": None, "log_evidence": None,
+        "time_window_start": None, "time_window_end": None,
+        "log_evidence": None,
         "similar_incidents": None, "response": None,
         "rca_sections": None,
     }
@@ -753,7 +740,8 @@ async def chat_stream(req: ChatRequest):
             "project_id": req.project_id,
             "persona": req.persona,
             "order_no": None, "intent": None,
-            "order_status": None, "log_evidence": None,
+            "time_window_start": None, "time_window_end": None,
+            "log_evidence": None,
             "similar_incidents": None, "response": None,
             "rca_sections": None,
         }
