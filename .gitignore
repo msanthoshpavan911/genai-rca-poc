@@ -15,10 +15,12 @@ env/
 *.swp
 .DS_Store
 
-# Data
+# Data & Simulator
 data/
 *.log
 *.sqlite
+opensearch-mock-simulator/
+simulator/
 
 # Env files
 .env
