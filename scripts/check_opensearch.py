@@ -2,25 +2,10 @@
 OpenSearch connectivity checker.
 
 Connects to OpenSearch, verifies the cluster is reachable, and lists all
-available indices with their document counts and sizes.
+available indices with their document counts.
 
 Usage:
     python scripts/check_opensearch.py
-
-Environment variables:
-    OPENSEARCH_HOST      Host (default: localhost)
-    OPENSEARCH_PORT      Port (default: 9200)
-    OPENSEARCH_USER      Username for basic auth (default: none)
-    OPENSEARCH_PASSWORD  Password for basic auth (default: none)
-    OPENSEARCH_USE_SSL   Set to "true" to enable TLS (default: false)
-    OPENSEARCH_CA_CERTS  Path to CA certificate file (optional, for self-signed certs)
-
-Examples:
-    # Local POC (no auth)
-    python scripts/check_opensearch.py
-
-    # Secured / enterprise
-    OPENSEARCH_HOST=prod-host OPENSEARCH_USER=admin OPENSEARCH_PASSWORD=secret OPENSEARCH_USE_SSL=true python scripts/check_opensearch.py
 """
 
 import asyncio
@@ -33,7 +18,7 @@ OPENSEARCH_HOST     = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT     = int(os.getenv("OPENSEARCH_PORT", "9200"))
 OPENSEARCH_USER     = os.getenv("OPENSEARCH_USER", "")
 OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD", "")
-OPENSEARCH_USE_SSL  = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
+OPENSEARCH_USE_SSL  = os.getenv("OPENSEARCH_USE_SSL", "false").lower() in ("true", "1", "yes")
 OPENSEARCH_CA_CERTS = os.getenv("OPENSEARCH_CA_CERTS", "")
 
 
@@ -41,7 +26,7 @@ def _build_client() -> AsyncOpenSearch:
     kwargs = {
         "hosts": [{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
         "use_ssl": OPENSEARCH_USE_SSL,
-        "verify_certs": OPENSEARCH_USE_SSL,   # only verify when SSL is on
+        "verify_certs": False,
     }
     if OPENSEARCH_USER and OPENSEARCH_PASSWORD:
         kwargs["http_auth"] = (OPENSEARCH_USER, OPENSEARCH_PASSWORD)
@@ -55,86 +40,57 @@ async def main():
 
     auth_label = f"{OPENSEARCH_USER}@" if OPENSEARCH_USER else ""
     ssl_label  = " [SSL]" if OPENSEARCH_USE_SSL else ""
-    print(f"\n🔌 Connecting to OpenSearch at {auth_label}{OPENSEARCH_HOST}:{OPENSEARCH_PORT}{ssl_label} ...\n")
+    print(f"\n[INFO] Connecting to OpenSearch at {auth_label}{OPENSEARCH_HOST}:{OPENSEARCH_PORT}{ssl_label} ...\n")
 
-
-    # ── 1. Cluster health ───────────────────────────────────────────────────
+    # 1. Cluster health
     try:
         health = await client.cluster.health()
-        status = health.get("status", "unknown")
-        icon = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(status, "⚪")
-        print(f"{icon} Cluster health : {status.upper()}")
-        print(f"   Cluster name  : {health.get('cluster_name')}")
-        print(f"   Nodes         : {health.get('number_of_nodes')}")
-        print(f"   Active shards : {health.get('active_shards')}")
+        status = health.get("status", "unknown").upper()
+        print("=" * 70)
+        print(f" [STATUS] CLUSTER HEALTH: {status}")
+        print("=" * 70)
+        print(f"  Cluster Name : {health.get('cluster_name')}")
+        print(f"  Nodes        : {health.get('number_of_nodes')} total, {health.get('number_of_data_nodes')} data")
+        print(f"  Active Shards: {health.get('active_primary_shards')} primary, {health.get('active_shards')} total")
     except Exception as e:
-        print(f"❌ Could not reach OpenSearch: {e}")
+        print(f" [FAIL] COULD NOT CONNECT TO OPENSEARCH: {e}")
         await client.close()
         return
 
-    # ── 2. Cluster info (version) ───────────────────────────────────────────
+    # 2. Engine info
     try:
         info = await client.info()
         version = info.get("version", {}).get("number", "unknown")
-        print(f"   Version       : {version}\n")
+        print(f"  Engine       : OpenSearch v{version}")
     except Exception:
-        print()
+        pass
 
-    # ── 3. List all indices ─────────────────────────────────────────────────
+    print()
+
+    # 3. List indices
     try:
-        # cat/indices returns a list of dicts when format=json
-        indices = await client.cat.indices(
-            params={"format": "json", "s": "index", "h": "index,status,health,docs.count,store.size,pri,rep"}
-        )
-
-        if not indices:
-            print("ℹ️  No indices found.")
+        cat_indices = await client.cat.indices(format="json", s="index")
+        if cat_indices:
+            print("=" * 70)
+            print(f" [INFO] INDICES LIST ({len(cat_indices)} total)")
+            print("=" * 70)
+            print(f" {'HEALTH':<8} {'STATUS':<8} {'INDEX NAME':<40} {'DOCS':>8} {'SIZE':>10}")
+            print("-" * 75)
+            for idx in cat_indices:
+                h = (idx.get("health") or "").upper()
+                st = idx.get("status") or ""
+                name = idx.get("index") or ""
+                docs = idx.get("docs.count") or "0"
+                sz = idx.get("store.size") or "0b"
+                print(f" {h:<8} {st:<8} {name:<40} {docs:>8} {sz:>10}")
+            print("=" * 75)
         else:
-            print(f"{'INDEX':<40} {'STATUS':<10} {'HEALTH':<8} {'DOCS':>8} {'SIZE':>10}  {'PRI'}/{{'REP'}}")
-            print("-" * 90)
-            for idx in indices:
-                health_icon = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(idx.get("health", ""), "⚪")
-                print(
-                    f"{idx.get('index', ''):<40} "
-                    f"{idx.get('status', ''):<10} "
-                    f"{health_icon} {idx.get('health', ''):<6} "
-                    f"{idx.get('docs.count', '0'):>8} "
-                    f"{idx.get('store.size', 'N/A'):>10}  "
-                    f"{idx.get('pri', '?')}/{idx.get('rep', '?')}"
-                )
-            print(f"\n✅ Total indices: {len(indices)}")
+            print(" [INFO] OpenSearch is running but has no indices yet.")
     except Exception as e:
-        print(f"❌ Failed to list indices: {e}")
-
-    # ── 4. Quick query — document count per POC index ───────────────────────
-    poc_indices = ["logs-vectors-current", "incidents-historical"]
-    print("\n── POC Index Details ──────────────────────────────────────────────────\n")
-    for index_name in poc_indices:
-        try:
-            exists = await client.indices.exists(index=index_name)
-            if not exists:
-                print(f"  {index_name:<30} ⚠️  does not exist")
-                continue
-
-            count_resp = await client.count(index=index_name)
-            count = count_resp.get("count", 0)
-
-            mapping = await client.indices.get_mapping(index=index_name)
-            fields = list(
-                mapping.get(index_name, {})
-                .get("mappings", {})
-                .get("properties", {})
-                .keys()
-            )
-
-            print(f"  {index_name}")
-            print(f"    Documents : {count}")
-            print(f"    Fields    : {', '.join(fields)}\n")
-        except Exception as e:
-            print(f"  {index_name:<30} ❌ {e}\n")
+        print(f" [FAIL] Could not list indices: {e}")
 
     await client.close()
-    print("👋 Done.\n")
+    print("\n[OK] Check complete.\n")
 
 
 if __name__ == "__main__":
