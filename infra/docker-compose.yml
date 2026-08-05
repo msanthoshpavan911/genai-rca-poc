@@ -1,16 +1,11 @@
 # =============================================================================
-# GenAI RCA - Local Infrastructure
+# GenAI RCA — Module 1: Local Infrastructure
 # =============================================================================
-# Brings up local infrastructure for development/testing. Zero cost.
+# Brings up OpenSearch for local development/testing. The live architecture
+# reads directly from existing production OpenSearch indices (see
+# services/mcp-server/project_config.py).
 #
-# The live architecture reads directly from an existing production
-# OpenSearch index (see services/mcp-server/project_config.py) — Kafka and
-# a dedicated ingestor are not part of the current design. This compose file
-# only provisions what local dev/testing actually needs: OpenSearch (to
-# stand in for the client's index), Postgres (optional order-status lookup),
-# and Redis (Module 3's poller checkpoints/dedup).
-#
-# Memory budget: ~2 GB. Plus ~5 GB for Ollama LLM = 7 GB total.
+# Memory budget: ~2 GB (OpenSearch)
 #
 # Usage:
 #   docker compose up -d
