@@ -329,6 +329,9 @@
         }
 
         function newSession() {
+          if (sessionId) {
+            fetch(`http://localhost:8000/api/v1/sessions/${sessionId}`, { method: "DELETE" }).catch(() => {});
+          }
           setProject(null);
           setPersona(null);
           setSessionId(newSessionId());

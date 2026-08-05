@@ -41,6 +41,8 @@ OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 SYNTHESIS_MODEL  = os.getenv("SYNTHESIS_MODEL", "qwen2.5:7b")
 ROUTER_MODEL     = os.getenv("ROUTER_MODEL", "qwen2.5:3b")
 REDIS_URL        = os.getenv("REDIS_URL", "redis://localhost:6379")
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+
 
 # Used when the client doesn't yet send a project_id (e.g. old curl demos).
 # Module 4 (chat UI) is expected to make project selection explicit per session.
@@ -206,6 +208,111 @@ class AgentState(TypedDict):
     similar_incidents: Optional[List[Dict]]
     response: Optional[str]
     rca_sections: Optional[Dict[str, str]]
+    chat_history: Optional[List[Dict[str, str]]]
+
+
+# =============================================================================
+# REDIS SESSION MEMORY HELPERS
+# =============================================================================
+async def load_session_history(session_id: str, limit: int = 10) -> List[Dict[str, str]]:
+    """Fetch stored conversation turns from Redis for the given session_id.
+    Returns list of dicts: [{'role': 'user'|'assistant', 'content': '...', 'timestamp': '...'}]"""
+    if not redis_client or not session_id:
+        return []
+    try:
+        raw_items = await redis_client.lrange(f"session:{session_id}:history", -limit * 2, -1)
+        history = []
+        for item in raw_items:
+            try:
+                history.append(json.loads(item))
+            except Exception:
+                pass
+        return history
+    except Exception as e:
+        log.warning(f"Failed to load session history for {session_id}: {e}")
+        return []
+
+
+async def save_session_turn(
+    session_id: str,
+    user_msg: str,
+    bot_resp: str,
+    project_id: Optional[str] = None,
+    persona: Optional[str] = None,
+):
+    """Save a user prompt and assistant response to Redis history, updating TTL and session metadata."""
+    if not redis_client or not session_id:
+        return
+    try:
+        now_str = datetime.now(timezone.utc).isoformat()
+        pipe = redis_client.pipeline()
+
+        user_entry = json.dumps({"role": "user", "content": user_msg, "timestamp": now_str})
+        bot_entry = json.dumps({"role": "assistant", "content": bot_resp, "timestamp": now_str})
+
+        history_key = f"session:{session_id}:history"
+        meta_key = f"session:{session_id}:meta"
+
+        pipe.rpush(history_key, user_entry, bot_entry)
+        pipe.expire(history_key, SESSION_TTL_SECONDS)
+
+        meta_update = {"updated_at": now_str}
+        if project_id:
+            meta_update["project_id"] = project_id
+        if persona:
+            meta_update["persona"] = persona
+
+        pipe.hset(meta_key, mapping=meta_update)
+        pipe.expire(meta_key, SESSION_TTL_SECONDS)
+
+        await pipe.execute()
+        log.info(f"Saved session turn to Redis for session_id={session_id}")
+    except Exception as e:
+        log.warning(f"Failed to save session turn for {session_id}: {e}")
+
+
+async def delete_session_memory(session_id: str) -> bool:
+    """Clear history and metadata for a session from Redis."""
+    if not redis_client or not session_id:
+        return False
+    try:
+        history_key = f"session:{session_id}:history"
+        meta_key = f"session:{session_id}:meta"
+        await redis_client.delete(history_key, meta_key)
+        log.info(f"Deleted session memory for {session_id}")
+        return True
+    except Exception as e:
+        log.warning(f"Failed to delete session memory for {session_id}: {e}")
+        return False
+
+
+async def get_session_memory_info(session_id: str) -> Dict:
+    """Get metadata and conversation history for a session."""
+    if not redis_client or not session_id:
+        return {
+            "session_id": session_id,
+            "history": [],
+            "metadata": {},
+            "redis_available": redis_client is not None,
+        }
+    try:
+        history = await load_session_history(session_id, limit=50)
+        meta = await redis_client.hgetall(f"session:{session_id}:meta")
+        return {
+            "session_id": session_id,
+            "history": history,
+            "metadata": meta,
+            "redis_available": True,
+        }
+    except Exception as e:
+        log.warning(f"Failed to get session info for {session_id}: {e}")
+        return {
+            "session_id": session_id,
+            "history": [],
+            "metadata": {},
+            "error": str(e),
+            "redis_available": True,
+        }
 
 
 # =============================================================================
@@ -285,9 +392,26 @@ async def classify_intent(state: AgentState) -> AgentState:
 
     # Quick rule: if it contains an order number, it's an inquiry
     order_no = extract_order_no(message)
+    if not order_no and state.get("chat_history"):
+        # Fall back to prior order_no in chat history if current prompt is a follow-up
+        for turn in reversed(state["chat_history"]):
+            found = extract_order_no(turn.get("content", ""))
+            if found:
+                order_no = found
+                log.info(f"Context inherited order_no {order_no} from session history.")
+                break
+
     state["order_no"] = order_no
 
+    if extract_order_no(message):
+        state["intent"] = "ORDER_INQUIRY"
+        start, end = await extract_time_window(message)
+        state["time_window_start"] = start
+        state["time_window_end"]   = end
+        return state
+
     if order_no:
+        # Inherited order_no from past turns in this session
         state["intent"] = "ORDER_INQUIRY"
         start, end = await extract_time_window(message)
         state["time_window_start"] = start
@@ -302,6 +426,7 @@ async def classify_intent(state: AgentState) -> AgentState:
         classification = "CLARIFICATION"
     state["intent"] = classification
     return state
+
 
 
 async def analyze_logs(state: AgentState) -> AgentState:
@@ -454,12 +579,21 @@ async def synthesize_rca(state: AgentState) -> AgentState:
     persona = state.get("persona") or DEFAULT_PERSONA
     persona_instructions = PERSONA_INSTRUCTIONS.get(persona, PERSONA_INSTRUCTIONS[DEFAULT_PERSONA])
 
+    # Include recent conversation turns if session history is present
+    history_context = ""
+    if state.get("chat_history"):
+        recent = state["chat_history"][-6:]  # last 3 turns
+        turns = [f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in recent]
+        history_context = "RECENT CONVERSATION HISTORY:\n" + "\n".join(turns) + "\n\n"
+
     prompt = RCA_SYNTHESIS_PROMPT.format(
         persona_instructions=persona_instructions,
         format_directive=_format_directive(chunks),
         log_evidence=evidence_str,
         similar_incidents=incidents_str,
     )
+    if history_context:
+        prompt = history_context + prompt
 
     llm = get_synthesis_llm()
     result = await llm.ainvoke([
@@ -709,6 +843,7 @@ async def list_projects_for_ui():
 @app.post("/api/v1/chat")
 async def chat(req: ChatRequest):
     """Non-streaming version (simpler, for testing with curl)."""
+    history = await load_session_history(req.session_id)
     state = {
         "user_message": req.message,
         "session_id": req.session_id,
@@ -719,10 +854,21 @@ async def chat(req: ChatRequest):
         "log_evidence": None,
         "similar_incidents": None, "response": None,
         "rca_sections": None,
+        "chat_history": history,
     }
     result = await agent.ainvoke(state)
+    response_text = result.get("response", "Sorry, no response.")
+
+    await save_session_turn(
+        session_id=req.session_id,
+        user_msg=req.message,
+        bot_resp=response_text,
+        project_id=req.project_id,
+        persona=req.persona,
+    )
+
     return {
-        "response": result.get("response", "Sorry, no response."),
+        "response": response_text,
         "intent": result.get("intent"),
         "order_no": result.get("order_no"),
         "evidence_count": len(result.get("log_evidence", {}).get("log_chunks", [])) if result.get("log_evidence") else 0,
@@ -733,6 +879,8 @@ async def chat(req: ChatRequest):
 @app.post("/api/v1/chat/stream")
 async def chat_stream(req: ChatRequest):
     """Streaming version via SSE — emits status events as each node executes."""
+    history = await load_session_history(req.session_id)
+
     async def event_stream():
         state = {
             "user_message": req.message,
@@ -744,12 +892,14 @@ async def chat_stream(req: ChatRequest):
             "log_evidence": None,
             "similar_incidents": None, "response": None,
             "rca_sections": None,
+            "chat_history": history,
         }
 
         yield f"data: {json.dumps({'type': 'start'})}\n\n"
 
         # Stream node-by-node updates
         response_sent = False
+        final_response = ""
         async for chunk in agent.astream(state):
             for node_name, node_state in chunk.items():
                 # Emit a progress event
@@ -763,21 +913,40 @@ async def chat_stream(req: ChatRequest):
                     )
                 yield f"data: {json.dumps(payload)}\n\n"
 
-                # Emit the response exactly once. synthesize sets it first, but
-                # the save_incident node runs after synthesize on the RCA path
-                # and still carries the same response forward — guard so the
-                # client doesn't receive it twice. is_rca is derived directly
-                # from the text (same check _parse_rca_sections uses) rather
-                # than from state["rca_sections"], since that field isn't
-                # populated yet at the point synthesize's response first appears.
+                if node_state.get("response"):
+                    final_response = node_state["response"]
+
                 if node_state.get("response") and not response_sent:
                     response_sent = True
                     is_rca = "**Root Cause**" in node_state["response"]
                     yield f"data: {json.dumps({'type': 'response', 'content': node_state['response'], 'is_rca': is_rca})}\n\n"
 
+        if final_response:
+            await save_session_turn(
+                session_id=req.session_id,
+                user_msg=req.message,
+                bot_resp=final_response,
+                project_id=req.project_id,
+                persona=req.persona,
+            )
+
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/v1/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Retrieve stored session memory (history + metadata) from Redis."""
+    return await get_session_memory_info(session_id)
+
+
+@app.delete("/api/v1/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Delete session memory from Redis."""
+    success = await delete_session_memory(session_id)
+    return {"status": "ok" if success else "failed", "session_id": session_id}
+
 
 
 # =============================================================================

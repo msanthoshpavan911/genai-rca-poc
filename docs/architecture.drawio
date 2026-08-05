@@ -1,0 +1,228 @@
+<mxfile host="Electron" modified="2026-07-31T15:00:00.000Z" agent="Mozilla/5.0" version="21.6.8" type="device">
+  <diagram id="genai-rca-system-architecture" name="GenAI RCA Technical Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- TITLE CONTAINER -->
+        <mxCell id="title_box" value="GenAI Log Analysis &amp; Root Cause Analysis (RCA) Assistant&#xa;Technical Architecture &amp; Component Interaction Diagram" style="shape=mxgraph.basic.rectangle;fillColor=#0F172A;strokeColor=#334155;fontColor=#F8FAFC;fontSize=18;fontStyle=1;alignment=center;verticalAlignment=middle;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1720" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- CONTAINER 1: EXISTING CLIENT INFRASTRUCTURE -->
+        <mxCell id="container_client_infra" value="EXISTING CLIENT INFRASTRUCTURE (Read-Only Target)" style="swimlane;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;fontColor=#1E293B;fontSize=14;fontStyle=1;startSize=30;rounded=1;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="520" height="320" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_spring_apps" value="Spring Boot Microservices&#xa;(Order, Payment, Shipping, etc.)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E2E8F0;strokeColor=#475569;fontColor=#0F172A;fontSize=12;fontStyle=1;" vertex="1" parent="container_client_infra">
+          <mxGeometry x="30" y="50" width="210" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_fluentbit" value="Fluentbit Log Collector / Shipper&#xa;(Appends loggingId correlation trace)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E2E8F0;strokeColor=#475569;fontColor=#0F172A;fontSize=12;fontStyle=1;" vertex="1" parent="container_client_infra">
+          <mxGeometry x="280" y="50" width="210" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_client_opensearch" value="Client Production OpenSearch Indices&#xa;e.g. fluentbit-csg-gr2v_app_launchpad-alias&#xa;• Contains raw application logs&#xa;• Filterable by msg &amp; loggingId.keyword" style="shape=datastore;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#1E3A8A;fontSize=11;fontStyle=1;" vertex="1" parent="container_client_infra">
+          <mxGeometry x="110" y="150" width="300" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="edge_apps_fluentbit" value="Application Logs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#475569;fontSize=10;" edge="1" parent="container_client_infra" source="node_spring_apps" target="node_fluentbit">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="edge_fluentbit_opensearch" value="Ship Logs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#475569;fontSize=10;" edge="1" parent="container_client_infra" source="node_fluentbit" target="node_client_opensearch">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- CONTAINER 2: USER PRESENTATION LAYER -->
+        <mxCell id="container_ui" value="USER PRESENTATION LAYER (Module 4 &amp; 5)" style="swimlane;whiteSpace=wrap;html=1;fillColor=#F0FDFA;strokeColor=#0D9488;fontColor=#115E59;fontSize=14;fontStyle=1;startSize=30;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="600" y="100" width="560" height="320" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_chat_ui" value="React Single-File Chatbot UI&#xa;(services/ui/index.html - Port 3000)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#CCFBF1;strokeColor=#0F766E;fontColor=#115E59;fontSize=12;fontStyle=1;" vertex="1" parent="container_ui">
+          <mxGeometry x="30" y="50" width="500" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_proj_picker" value="Project Selection Guard&#xa;• Selects target project index&#xa;• Session locked post-greeting" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6FFFA;strokeColor=#14B8A6;fontColor=#134E4A;fontSize=11;" vertex="1" parent="container_ui">
+          <mxGeometry x="40" y="140" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_persona_picker" value="Persona-Aware Response Selector&#xa;• Technical SRE (Jargon &amp; Exceptions)&#xa;• Business User (Non-technical plain text)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6FFFA;strokeColor=#14B8A6;fontColor=#134E4A;fontSize=11;" vertex="1" parent="container_ui">
+          <mxGeometry x="290" y="140" width="230" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_chat_interaction" value="User Plain-English Query Input &amp; Markdown / Formatted RCA Render&#xa;e.g. &quot;Why did ORD-00143 fail on 7th July?&quot;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;fontStyle=2;" vertex="1" parent="container_ui">
+          <mxGeometry x="40" y="235" width="480" height="65" as="geometry" />
+        </mxCell>
+
+        <!-- CONTAINER 3: GENAI ORCHESTRATION & AGENT ENGINE -->
+        <mxCell id="container_orchestrator" value="GENAI ORCHESTRATION LAYER (FastAPI + LangGraph Engine - Port 8000)" style="swimlane;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#7C3AED;fontColor=#581C87;fontSize=14;fontStyle=1;startSize=30;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="460" width="1120" height="480" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_fastapi_entry" value="FastAPI Server (main.py)&#xa;Endpoints: POST /api/v1/chat, POST /api/v1/internal/analyze_incident" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E9D5FF;strokeColor=#6B21A8;fontColor=#4C1D95;fontSize=12;fontStyle=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="30" y="50" width="1060" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- LANGGRAPH STATE MACHINE NODES -->
+        <mxCell id="node_lg_classify" value="[Node 1] classify_intent&#xa;• Order regex check (ORD-XXXXX)&#xa;• Router LLM (qwen2.5:3b) classification&#xa;• Extract ISO Time Window" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF5FF;strokeColor=#8B5CF6;fontColor=#581C87;fontSize=11;fontStyle=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="30" y="130" width="220" height="75" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_lg_analyze" value="[Node 2] analyze_logs&#xa;Calls MCP /tools/analyze_order_logs&#xa;• Anchor text search (msg)&#xa;• loggingId trace expansion" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF5FF;strokeColor=#8B5CF6;fontColor=#581C87;fontSize=11;fontStyle=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="300" y="130" width="230" height="75" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_lg_find_similar" value="[Node 3] find_similar&#xa;• Error line extraction / keyword expansion&#xa;• Calls MCP /tools/find_similar_incidents&#xa;• BM25 search in incidents-historical" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF5FF;strokeColor=#8B5CF6;fontColor=#581C87;fontSize=11;fontStyle=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="580" y="130" width="240" height="75" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_lg_synthesize" value="[Node 4] synthesize_rca&#xa;• Formats log evidence &amp; past RCAs&#xa;• Enforces FORMAT A/B directive in code&#xa;• LLM Synthesis (qwen2.5:7b / Sonnet)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF5FF;strokeColor=#8B5CF6;fontColor=#581C87;fontSize=11;fontStyle=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="850" y="130" width="240" height="75" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_lg_save" value="[Node 5] save_incident&#xa;• Parses RCA Markdown sections&#xa;• Writes back to incidents-historical&#xa;• Source: auto-generated / proactive-alert" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF5FF;strokeColor=#8B5CF6;fontColor=#581C87;fontSize=11;fontStyle=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="850" y="245" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_lg_happy" value="happy_path_summary&#xa;Deterministic success trace summary&#xa;(Zero LLM call - No hallucination)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontColor=#14532D;fontSize=11;fontStyle=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="300" y="245" width="230" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_lg_no_evidence" value="no_evidence&#xa;Returns zero-log notification&#xa;(Immediate code response)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF2F2;strokeColor=#DC2626;fontColor=#7F1D1D;fontSize=11;fontStyle=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="580" y="245" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- LLM ENGINES SUB-BOX -->
+        <mxCell id="box_llm" value="LLM Runtime Engine (Local Ollama / Production Claude)" style="swimlane;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#A855F7;fontColor=#6B21A8;fontSize=12;fontStyle=1;startSize=25;rounded=1;" vertex="1" parent="container_orchestrator">
+          <mxGeometry x="30" y="340" width="1060" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_llm_router" value="Router LLM (qwen2.5:3b / Claude Haiku)&#xa;• Intent Classification&#xa;• ISO Datetime Range Parsing&#xa;• Business-to-Technical Keyword Expansion" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontColor=#581C87;fontSize=11;fontStyle=1;" vertex="1" parent="box_llm">
+          <mxGeometry x="40" y="40" width="470" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_llm_synthesis" value="Synthesis LLM (qwen2.5:7b / Claude Sonnet)&#xa;• Evidence-Grounded RCA Narrative Generation&#xa;• Enforces Persona Tuning (Technical SRE vs Business User)&#xa;• Strictly bounded to provided log evidence" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontColor=#581C87;fontSize=11;fontStyle=1;" vertex="1" parent="box_llm">
+          <mxGeometry x="550" y="40" width="470" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- CONTAINER 4: MCP TOOL & DATA INTEGRATION LAYER -->
+        <mxCell id="container_mcp" value="MCP TOOL &amp; DATA ACCESS LAYER (FastAPI Port 8001)" style="swimlane;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=14;fontStyle=1;startSize=30;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="100" width="560" height="840" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_mcp_server" value="MCP Tool Server (services/mcp-server/server.py)&#xa;Project Index Config Loader (project_config.py)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FDE68A;strokeColor=#B45309;fontColor=#78350F;fontSize=12;fontStyle=1;" vertex="1" parent="container_mcp">
+          <mxGeometry x="30" y="50" width="500" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_tool_analyze" value="Tool 1: analyze_order_logs&#xa;• Step 1: Anchor search on msg field&#xa;• Step 2: Trace expansion on loggingId.keyword" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBEB;strokeColor=#F59E0B;fontColor=#78350F;fontSize=11;fontStyle=1;" vertex="1" parent="container_mcp">
+          <mxGeometry x="30" y="120" width="500" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_tool_trace" value="Tool 2: get_trace_by_logging_id&#xa;• Direct step-2 trace fetch by loggingId&#xa;• Used by Proactive Poller for single-trace pull" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBEB;strokeColor=#F59E0B;fontColor=#78350F;fontSize=11;fontStyle=1;" vertex="1" parent="container_mcp">
+          <mxGeometry x="30" y="195" width="500" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_tool_errors" value="Tool 3: find_new_errors&#xa;• Scans OpenSearch for level=ERROR since checkpoint&#xa;• Dedups results by loggingId for poller" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBEB;strokeColor=#F59E0B;fontColor=#78350F;fontSize=11;fontStyle=1;" vertex="1" parent="container_mcp">
+          <mxGeometry x="30" y="270" width="500" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_tool_similar" value="Tool 4: find_similar_incidents&#xa;• BM25 full-text multi_match on incidents-historical&#xa;• Returns top K past RCAs &amp; resolution steps" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBEB;strokeColor=#F59E0B;fontColor=#78350F;fontSize=11;fontStyle=1;" vertex="1" parent="container_mcp">
+          <mxGeometry x="30" y="345" width="500" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_tool_save" value="Tool 5: save_incident&#xa;• Writes structured RCA back to incidents-historical&#xa;• Tagged source (curated / auto-generated / proactive-alert)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBEB;strokeColor=#F59E0B;fontColor=#78350F;fontSize=11;fontStyle=1;" vertex="1" parent="container_mcp">
+          <mxGeometry x="30" y="420" width="500" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_tool_status" value="Tool 6: get_order_status&#xa;• SQL JOIN mock on orders/payments/shipments&#xa;• Supplementary structured status lookup" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBEB;strokeColor=#F59E0B;fontColor=#78350F;fontSize=11;fontStyle=1;" vertex="1" parent="container_mcp">
+          <mxGeometry x="30" y="495" width="500" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_opensearch_historical" value="GenAI-Owned OpenSearch Index: incidents-historical&#xa;• Stores baseline curated RCAs &amp; auto-generated RCAs&#xa;• Serves as knowledge store for BM25 RAG similarity search" style="shape=datastore;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=12;fontStyle=1;" vertex="1" parent="container_mcp">
+          <mxGeometry x="80" y="600" width="400" height="190" as="geometry" />
+        </mxCell>
+
+        <!-- CONTAINER 5: PROACTIVE MONITORING & ALERTING LAYER -->
+        <mxCell id="container_monitor" value="PROACTIVE MONITORING &amp; ALERTING LAYER (Module 3)" style="swimlane;whiteSpace=wrap;html=1;fillColor=#EFF6FF;strokeColor=#3B82F6;fontColor=#1E40AF;fontSize=14;fontStyle=1;startSize=30;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="970" width="1720" height="340" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_poller" value="Proactive Monitor Poller (services/monitor/poller.py)&#xa;• Loops every 600s (10 min) across all registered projects&#xa;• Dynamically fetches project list from MCP /projects" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#1E40AF;fontSize=12;fontStyle=1;" vertex="1" parent="container_monitor">
+          <mxGeometry x="30" y="50" width="480" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_redis" value="Redis Key-Value Cache (Port 6379)&#xa;• Checkpoints: monitor:checkpoint:&lt;project_id&gt; (last-seen ISO)&#xa;• Alert Dedup: monitor:alerted:&lt;project_id&gt;:&lt;logging_id&gt; (TTL 24h)" style="shape=datastore;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#EF4444;fontColor=#991B1B;fontSize=12;fontStyle=1;" vertex="1" parent="container_monitor">
+          <mxGeometry x="560" y="45" width="420" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_alert_dispatch" value="Multi-Channel Alert Dispatcher&#xa;• Formats proactive RCA findings into notifications&#xa;• Prevents duplicate alerts via Redis key validation" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#1E40AF;fontSize=12;fontStyle=1;" vertex="1" parent="container_monitor">
+          <mxGeometry x="1030" y="50" width="660" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_channel_email" value="Email DL Notification&#xa;(SMTP / aiosmtplib)&#xa;HTML / Text RCA Report" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3B82F6;fontColor=#1E40AF;fontSize=11;fontStyle=1;" vertex="1" parent="container_monitor">
+          <mxGeometry x="1030" y="180" width="310" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_channel_slack" value="Slack Channel Alert&#xa;(Incoming Webhooks)&#xa;Structured Block Alert" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3B82F6;fontColor=#1E40AF;fontSize=11;fontStyle=1;" vertex="1" parent="container_monitor">
+          <mxGeometry x="1380" y="180" width="310" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- MAIN INTER-CONTAINER ARROWS / CONNECTORS -->
+        <mxCell id="edge_ui_orch" value="HTTP POST /api/v1/chat (JSON / SSE)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#0D9488;strokeWidth=2;fontSize=11;fontStyle=1;" edge="1" parent="1" source="node_chat_ui" target="node_fastapi_entry">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="edge_orch_mcp" value="HTTP POST /tools/* (JSON)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#7C3AED;strokeWidth=2;fontSize=11;fontStyle=1;" edge="1" parent="1" source="container_orchestrator" target="container_mcp">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1170" y="600" />
+              <mxPoint x="1170" y="520" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="edge_mcp_client_os" value="OpenSearch Read Query (msg / loggingId)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D97706;strokeWidth=2;fontSize=11;fontStyle=1;" edge="1" parent="1" source="container_mcp" target="node_client_opensearch">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1180" y="260" />
+              <mxPoint x="1180" y="260" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="edge_poller_mcp" value="1. POST /tools/find_new_errors&#xa;2. POST /tools/get_trace_by_logging_id" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#2563EB;strokeWidth=2;fontSize=11;fontStyle=1;" edge="1" parent="1" source="node_poller" target="container_mcp">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="280" y="950" />
+              <mxPoint x="1480" y="950" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="edge_poller_orch" value="3. POST /api/v1/internal/analyze_incident" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#2563EB;strokeWidth=2;fontSize=11;fontStyle=1;" edge="1" parent="1" source="node_poller" target="container_orchestrator">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="400" y="950" />
+              <mxPoint x="400" y="950" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="edge_poller_redis" value="Read/Write Checkpoints &amp; Dedup" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#EF4444;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="node_poller" target="node_redis">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="edge_dispatch_email" value="Send Email" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#3B82F6;strokeWidth=1.5;" edge="1" parent="container_monitor" source="node_alert_dispatch" target="node_channel_email">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="edge_dispatch_slack" value="Post Webhook" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#3B82F6;strokeWidth=1.5;" edge="1" parent="container_monitor" source="node_alert_dispatch" target="node_channel_slack">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

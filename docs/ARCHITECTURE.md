@@ -561,8 +561,10 @@ Standalone async process. Runs a `while True` loop with `asyncio.sleep(POLL_INTE
 
 **Redis key structure:**
 ```
-monitor:checkpoint:<project_id>      →  ISO datetime string (last scanned until)
+monitor:checkpoint:<project_id>           →  ISO datetime string (last scanned until)
 monitor:alerted:<project_id>:<loggingId>  →  "1"  (TTL = ALERTED_TTL_SECONDS = 24h)
+session:<session_id>:history              →  List of JSON turn objects (TTL = 24h)
+session:<session_id>:meta                 →  Hash of session metadata (TTL = 24h)
 ```
 
 **Graceful degradation:** Notifications (email, Slack) are fully optional. If
