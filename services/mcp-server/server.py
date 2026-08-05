@@ -296,12 +296,12 @@ async def get_logs(
     if until:
         ts_range["lte"] = until
 
-    # Step 1: Anchor search — find log lines mentioning this order ID
+    # Step 1: Anchor search — find log lines mentioning this order/entity number in msg
     anchor_body = {
         "size": 50,
         "query": {
             "bool": {
-                "must": [{"match_phrase": {search_field: order_id}}],
+                "must": [{"match": {search_field: {"query": order_id, "operator": "and"}}}],
                 "filter": [{"range": {"@timestamp": ts_range}}],
                 "should": [{"match": {"level": {"query": "ERROR", "boost": 1.5}}}],
             }
