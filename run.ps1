@@ -6,8 +6,7 @@
 #     .\run.ps1 help              Show all commands
 #     .\run.ps1 install           Install Python dependencies
 #     .\run.ps1 server            Run Module 1 log retrieval server (port 8001)
-#     .\run.ps1 check-opensearch  Verify OpenSearch cluster connection
-#     .\run.ps1 demo              Test log retrieval API for sample order ORD-00042
+#     .\run.ps1 demo              Test log retrieval API for sample order 99831
 # =============================================================================
 
 param(
@@ -47,14 +46,10 @@ switch ($Command.ToLower()) {
         Set-Location "$RepoRoot\services\mcp-server"
         & $PythonExe -m uvicorn server:app --port 8001 --reload
     }
-    "check-opensearch" {
-        Write-Info "Checking OpenSearch connectivity..."
-        & $PythonExe "$RepoRoot\scripts\check_opensearch.py"
-    }
     "demo" {
-        Write-Info "Querying log retrieval endpoint for order ORD-00042..."
+        Write-Info "Querying log retrieval endpoint for order 99831..."
         try {
-            $resp = Invoke-RestMethod -Uri "http://localhost:8001/api/v1/logs?order_id=ORD-00042&project_id=app_launchpad" -Method Get
+            $resp = Invoke-RestMethod -Uri "http://localhost:8001/api/v1/logs?order_id=99831&project_id=app_launchpad" -Method Get
             $resp | ConvertTo-Json -Depth 5
         } catch {
             Write-Err "Failed to reach server. Make sure '.\run.ps1 server' is running."
@@ -67,8 +62,7 @@ GenAI RCA — Module 1 (Production Log Retrieval Layer)
 Available Commands:
   .\run.ps1 install           Install Python dependencies
   .\run.ps1 server            Run log retrieval REST server (http://localhost:8001)
-  .\run.ps1 check-opensearch  Verify OpenSearch connectivity
-  .\run.ps1 demo              Test endpoint with sample order ORD-00042
+  .\run.ps1 demo              Test endpoint with sample order 99831
 "@ -ForegroundColor Yellow
     }
 }
