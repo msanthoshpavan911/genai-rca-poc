@@ -24,13 +24,19 @@ from typing import Annotated, Dict, List, Literal, Optional, TypedDict
 
 import httpx
 import redis.asyncio as redis
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
+
+
+# Automatically load .env file from project root or working directory
+load_dotenv(override=True)
+
 
 
 # =============================================================================
@@ -38,9 +44,16 @@ from pydantic import BaseModel
 # =============================================================================
 MCP_BASE_URL     = os.getenv("MCP_BASE_URL", "http://localhost:8001")
 OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-SYNTHESIS_MODEL  = os.getenv("SYNTHESIS_MODEL", "qwen2.5:7b")
-ROUTER_MODEL     = os.getenv("ROUTER_MODEL", "qwen2.5:3b")
 REDIS_URL        = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+# LLM Provider Config: "gemini" / "google" (via Google AI Studio) or "ollama" (local)
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+LLM_PROVIDER     = os.getenv("LLM_PROVIDER", "gemini" if GEMINI_API_KEY else "ollama").lower()
+GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+SYNTHESIS_MODEL  = os.getenv("SYNTHESIS_MODEL", GEMINI_MODEL if LLM_PROVIDER in ("gemini", "google") else "qwen2.5:7b")
+ROUTER_MODEL     = os.getenv("ROUTER_MODEL", GEMINI_MODEL if LLM_PROVIDER in ("gemini", "google") else "qwen2.5:3b")
+
 
 # Used when the client doesn't yet send a project_id (e.g. old curl demos).
 # Module 4 (chat UI) is expected to make project selection explicit per session.
@@ -257,22 +270,48 @@ async def call_mcp(tool_path: str, payload: dict) -> dict:
 
 
 # =============================================================================
-# LLMs
+# LLMs (Google AI Studio Gemini API Only — Ollama Disabled)
 # =============================================================================
+def _resolve_gemini_config():
+    load_dotenv()
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not gemini_key:
+        raise ValueError(
+            "GEMINI_API_KEY is not set in environment or .env file! "
+            "Ollama has been completely disabled. Please set GEMINI_API_KEY."
+        )
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+    
+    raw_router = os.getenv("ROUTER_MODEL", gemini_model)
+    raw_synthesis = os.getenv("SYNTHESIS_MODEL", gemini_model)
+    
+    router_model = raw_router if any(raw_router.startswith(prefix) for prefix in ("gemini", "gemma")) else gemini_model
+    synthesis_model = raw_synthesis if any(raw_synthesis.startswith(prefix) for prefix in ("gemini", "gemma")) else gemini_model
+
+    return gemini_key, router_model, synthesis_model
+
+
 def get_router_llm():
-    return ChatOllama(
-        model=ROUTER_MODEL,
-        base_url=OLLAMA_BASE_URL,
+    gemini_key, router_model, _ = _resolve_gemini_config()
+    log.info(f"Using Google AI Studio Gemini API (model: {router_model}) for Router LLM")
+    return ChatGoogleGenerativeAI(
+        model=router_model,
+        google_api_key=gemini_key,
         temperature=0.0,
     )
 
 
 def get_synthesis_llm():
-    return ChatOllama(
-        model=SYNTHESIS_MODEL,
-        base_url=OLLAMA_BASE_URL,
+    gemini_key, _, synthesis_model = _resolve_gemini_config()
+    log.info(f"Using Google AI Studio Gemini API (model: {synthesis_model}) for Synthesis LLM")
+    return ChatGoogleGenerativeAI(
+        model=synthesis_model,
+        google_api_key=gemini_key,
         temperature=0.2,
     )
+
+
+
 
 
 # =============================================================================

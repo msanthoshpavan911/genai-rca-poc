@@ -129,6 +129,10 @@ cd C:\Mamidi\2026\genai-rca-poc\genai-rca-poc\services\orchestrator
 $env:SYNTHESIS_MODEL = "qwen2.5:7b"   # or qwen2.5:3b on low-RAM machines
 $env:ROUTER_MODEL = "qwen2.5:3b"
 python -m uvicorn main:app --port 8000 --reload
+
+$env:LLM_PROVIDER="gemini"
+$env:GEMINI_API_KEY="your_gemini_api_key_here"
+python -m uvicorn main:app --port 8000 --reload --app-dir services/orchestrator
 ```
 Wait for `Application startup complete.` and `✅ Redis connected.`
 
@@ -206,7 +210,30 @@ Without a date, the default look-back is 24 hours.
 
 ---
 
+## Optional: Running with Google AI Studio (Gemini API)
+
+Instead of running local Ollama models, you can run the orchestrator with **Google Gemini (Gemini 2.0 Flash)** using an API key from Google AI Studio.
+
+1. Install `langchain-google-genai`:
+   ```powershell
+   pip install langchain-google-genai
+   ```
+2. Get an API key from [aistudio.google.com](https://aistudio.google.com/).
+3. Set your environment variables before launching the orchestrator:
+   ```powershell
+   $env:LLM_PROVIDER="gemini"
+   $env:GEMINI_API_KEY="AIzaSyYourActualKeyHere"
+   $env:GEMINI_MODEL="gemini-2.0-flash"  # Optional, default is gemini-2.0-flash
+   ```
+4. Start orchestrator:
+   ```powershell
+   .\run.ps1 orch
+   ```
+
+---
+
 ## Stopping Everything
+
 
 ```powershell
 .\run.ps1 down       # stop containers, keep data
